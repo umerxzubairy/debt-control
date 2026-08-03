@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/umernaeem/source/repos/**)",
+      "Bash(npm create *)",
+      "Bash(tail -20 /Users/umernaeem/.npm/_logs/2026-08-02T20_14_16_836Z-debug-0.log)",
+      "Bash(npm install *)",
+      "Bash(npx tsc *)",
+      "Bash(ps -p 43744 -o pid,command)",
+      "Bash(kill 43744)"
+    ]
+  }
+}
