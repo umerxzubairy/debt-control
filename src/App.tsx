@@ -100,6 +100,20 @@ export default function App() {
         {tab === 'debts' && <Debts state={state} dispatch={dispatch} />}
         {tab === 'income' && <IncomePanel state={state} dispatch={dispatch} />}
       </main>
+
+      <footer className="footer">
+        <span>
+          Open source ·{' '}
+          <a
+            href="https://github.com/umernaeem217/debt-control"
+            target="_blank"
+            rel="noreferrer"
+          >
+            GitHub
+          </a>
+        </span>
+        <span className="muted">Your data never leaves this browser.</span>
+      </footer>
     </div>
   )
 }
