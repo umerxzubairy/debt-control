@@ -55,10 +55,19 @@ export function buildPlan(state: AppState): PlanResult {
 
   // --- simulate cash day by day ---
   const paydayByDate = new Map(paydays.map((p) => [p.date, p.net]))
+  const oneTimes = state.income.oneTimes
+    .filter((e) => e.date >= today && e.date <= horizonEnd && e.amount > 0)
+    .sort((a, b) => a.date.localeCompare(b.date))
+  const oneTimeByDate = new Map<string, number>()
+  for (const e of oneTimes) {
+    const signed = e.kind === 'in' ? e.amount : -e.amount
+    oneTimeByDate.set(e.date, (oneTimeByDate.get(e.date) ?? 0) + signed)
+  }
   let cash = settings.bankBalance
   let day = today
   while (day <= horizonEnd) {
     cash += paydayByDate.get(day) ?? 0
+    cash += oneTimeByDate.get(day) ?? 0
     for (const ob of obligations) {
       if (ob.plannedDate) continue
       if (day < ob.payableFrom) continue
@@ -91,6 +100,7 @@ export function buildPlan(state: AppState): PlanResult {
   return {
     payments,
     paydays,
+    oneTimes,
     payoffOrder: buildPayoffOrder(debts, settings.strategy),
     totalRequired,
     shortfall,

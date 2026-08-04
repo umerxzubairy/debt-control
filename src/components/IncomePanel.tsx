@@ -16,6 +16,10 @@ export default function IncomePanel({
   const advancesTotal = income.advances.reduce((s, a) => s + a.amount, 0)
   const [advAmount, setAdvAmount] = useState('')
   const [advNote, setAdvNote] = useState('')
+  const [otAmount, setOtAmount] = useState('')
+  const [otDate, setOtDate] = useState(todayISO())
+  const [otKind, setOtKind] = useState<'in' | 'out'>('in')
+  const [otNote, setOtNote] = useState('')
 
   return (
     <div className="income">
@@ -188,6 +192,76 @@ export default function IncomePanel({
             </li>
           ))}
           {income.advances.length === 0 && <li className="muted">None recorded.</li>}
+        </ul>
+      </section>
+
+      <section className="panel">
+        <h3>One-time money</h3>
+        <p className="muted">
+          One-off cash that isn't salary — a bonus, tax refund, money a friend pays back
+          (money in), or a car repair, ticket, one-off bill (money out). The plan applies it
+          on its date.
+        </p>
+        <form
+          className="inline-form"
+          onSubmit={(e) => {
+            e.preventDefault()
+            const n = parseFloat(otAmount)
+            if (!isNaN(n) && n > 0 && otDate) {
+              dispatch({
+                type: 'addOneTime',
+                event: { id: uid(), amount: n, date: otDate, kind: otKind, note: otNote || undefined },
+              })
+              setOtAmount('')
+              setOtNote('')
+            }
+          }}
+        >
+          <select value={otKind} onChange={(e) => setOtKind(e.target.value as 'in' | 'out')}>
+            <option value="in">Money in</option>
+            <option value="out">Money out</option>
+          </select>
+          <input
+            type="number"
+            step="0.01"
+            min="0.01"
+            placeholder="Amount"
+            value={otAmount}
+            onChange={(e) => setOtAmount(e.target.value)}
+          />
+          <input type="date" value={otDate} onChange={(e) => setOtDate(e.target.value)} />
+          <input
+            placeholder="Note (optional)"
+            value={otNote}
+            onChange={(e) => setOtNote(e.target.value)}
+          />
+          <button className="btn" type="submit">
+            Add
+          </button>
+        </form>
+        <ul className="advance-list">
+          {[...income.oneTimes]
+            .sort((a, b) => a.date.localeCompare(b.date))
+            .map((e) => (
+              <li key={e.id}>
+                <span>
+                  <span className={e.kind === 'in' ? 'ok' : 'warn'}>
+                    {e.kind === 'in' ? '+' : '−'}
+                    {fmtMoney(e.amount)}
+                  </span>{' '}
+                  — {fmtDate(e.date)}
+                  {e.note && <span className="muted"> · {e.note}</span>}
+                  {e.date < todayISO() && <span className="pill"> past</span>}
+                </span>
+                <button
+                  className="btn small ghost"
+                  onClick={() => dispatch({ type: 'removeOneTime', id: e.id })}
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          {income.oneTimes.length === 0 && <li className="muted">None recorded.</li>}
         </ul>
       </section>
 

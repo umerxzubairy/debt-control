@@ -321,6 +321,9 @@ tr:last-child td {
 .unfunded-row td {
   background: rgba(242, 85, 90, 0.07);
 }
+.onetime-out-row td {
+  background: rgba(240, 180, 41, 0.07);
+}
 .row-actions {
   white-space: nowrap;
 }

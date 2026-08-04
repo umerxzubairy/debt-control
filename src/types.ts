@@ -48,6 +48,15 @@ export interface PayAdvance {
   note?: string
 }
 
+/** A one-off cash event: money coming in (bonus, refund) or going out (repair bill) */
+export interface OneTimeEvent {
+  id: string
+  amount: number
+  date: string
+  kind: 'in' | 'out'
+  note?: string
+}
+
 export interface Income {
   /** Net take-home per paycheck before advances */
   payAmount: number
@@ -58,6 +67,8 @@ export interface Income {
   advances: PayAdvance[]
   /** Groceries and other living costs set aside from every paycheck */
   livingExpenses: number
+  /** One-off cash in/out events on specific dates */
+  oneTimes: OneTimeEvent[]
 }
 
 export type Strategy = 'avalanche' | 'snowball'
@@ -111,6 +122,8 @@ export interface Payday {
 export interface PlanResult {
   payments: PlannedPayment[]
   paydays: Payday[]
+  /** One-time cash events that fall inside the planning horizon */
+  oneTimes: OneTimeEvent[]
   /** Suggested payoff order of debts under the chosen strategy */
   payoffOrder: { debtId: string; reason: string }[]
   /** Total of all minimums + past-due catch-ups in the horizon */

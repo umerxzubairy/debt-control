@@ -10,6 +10,7 @@ type Row =
       advancesDeducted: number
       livingDeducted: number
     }
+  | { kind: 'oneTime'; date: string; amount: number; direction: 'in' | 'out'; note?: string }
   | {
       kind: 'payment'
       date: string | null
@@ -30,6 +31,13 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
       advancesDeducted: p.advancesDeducted,
       livingDeducted: p.livingDeducted,
     })),
+    ...plan.oneTimes.map((e) => ({
+      kind: 'oneTime' as const,
+      date: e.date,
+      amount: e.amount,
+      direction: e.kind,
+      note: e.note,
+    })),
     ...plan.payments.map((p) => ({
       kind: 'payment' as const,
       date: p.plannedDate,
@@ -47,7 +55,7 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
     const da = a.date ?? '9999-12-31'
     const db = b.date ?? '9999-12-31'
     if (da !== db) return da.localeCompare(db)
-    return a.kind === 'payday' ? -1 : 1
+    return a.kind !== 'payment' ? -1 : 1
   })
 
   if (plan.payments.length === 0 && plan.paydays.length === 0) {
@@ -91,6 +99,21 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
                   )}
                 </td>
                 <td className="num ok">+{fmtMoney(r.net)}</td>
+                <td />
+                <td />
+              </tr>
+            ) : r.kind === 'oneTime' ? (
+              <tr key={i} className={r.direction === 'in' ? 'payday-row' : 'onetime-out-row'}>
+                <td>{fmtDate(r.date)}</td>
+                <td>—</td>
+                <td>
+                  {r.direction === 'in' ? '🎁 One-time in' : '🧾 One-time out'}
+                  {r.note && <span className="muted"> · {r.note}</span>}
+                </td>
+                <td className={`num ${r.direction === 'in' ? 'ok' : 'warn'}`}>
+                  {r.direction === 'in' ? '+' : '−'}
+                  {fmtMoney(r.amount)}
+                </td>
                 <td />
                 <td />
               </tr>

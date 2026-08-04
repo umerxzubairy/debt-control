@@ -1,5 +1,5 @@
 import { useEffect, useReducer } from 'react'
-import type { AppState, Debt, Income, PayAdvance, Settings } from './types'
+import type { AppState, Debt, Income, OneTimeEvent, PayAdvance, Settings } from './types'
 import { todayISO } from './engine/dates'
 
 const STORAGE_KEY = 'debt-control-v1'
@@ -12,6 +12,7 @@ export const initialState: AppState = {
     frequencyDays: 14,
     advances: [],
     livingExpenses: 0,
+    oneTimes: [],
   },
   settings: {
     bankBalance: 0,
@@ -29,6 +30,8 @@ export type Action =
   | { type: 'setIncome'; income: Income }
   | { type: 'addAdvance'; advance: PayAdvance }
   | { type: 'removeAdvance'; id: string }
+  | { type: 'addOneTime'; event: OneTimeEvent }
+  | { type: 'removeOneTime'; id: string }
   | { type: 'setSettings'; settings: Settings }
   | { type: 'importState'; state: AppState }
 
@@ -77,6 +80,19 @@ export function reducer(state: AppState, action: Action): AppState {
         income: {
           ...state.income,
           advances: state.income.advances.filter((a) => a.id !== action.id),
+        },
+      }
+    case 'addOneTime':
+      return {
+        ...state,
+        income: { ...state.income, oneTimes: [...state.income.oneTimes, action.event] },
+      }
+    case 'removeOneTime':
+      return {
+        ...state,
+        income: {
+          ...state.income,
+          oneTimes: state.income.oneTimes.filter((e) => e.id !== action.id),
         },
       }
     case 'setSettings':
