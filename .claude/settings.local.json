@@ -7,7 +7,9 @@
       "Bash(npm install *)",
       "Bash(npx tsc *)",
       "Bash(ps -p 43744 -o pid,command)",
-      "Bash(kill 43744)"
+      "Bash(kill 43744)",
+      "Bash(git check-ignore *)",
+      "Bash(git rm *)"
     ]
   }
 }
