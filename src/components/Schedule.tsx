@@ -11,6 +11,7 @@ type Row =
       livingDeducted: number
     }
   | { kind: 'oneTime'; date: string; amount: number; direction: 'in' | 'out'; note?: string }
+  | { kind: 'fee'; date: string; amount: number; balanceAfter: number }
   | {
       kind: 'payment'
       date: string | null
@@ -19,6 +20,7 @@ type Row =
       amount: number
       status: PlannedStatus
       autopay: boolean
+      lateFee: number
       isPastDueCatchUp: boolean
       balanceAfter?: number
     }
@@ -39,6 +41,12 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
       direction: e.kind,
       note: e.note,
     })),
+    ...plan.overdraftFeeEvents.map((f) => ({
+      kind: 'fee' as const,
+      date: f.date,
+      amount: f.amount,
+      balanceAfter: f.balanceAfter,
+    })),
     ...plan.payments.map((p) => ({
       kind: 'payment' as const,
       date: p.plannedDate,
@@ -47,6 +55,7 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
       amount: p.amount,
       status: p.status,
       autopay: p.autopay,
+      lateFee: p.lateFee,
       isPastDueCatchUp: p.isPastDueCatchUp,
       balanceAfter: p.balanceAfter,
     })),
@@ -57,7 +66,9 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
     const da = a.date ?? '9999-12-31'
     const db = b.date ?? '9999-12-31'
     if (da !== db) return da.localeCompare(db)
-    return a.kind !== 'payment' ? -1 : 1
+    // same day: money in first, then payments, then the bank's end-of-day fee
+    const order = { payday: 0, oneTime: 0, payment: 1, fee: 2 }
+    return order[a.kind] - order[b.kind]
   })
 
   if (plan.payments.length === 0 && plan.paydays.length === 0) {
@@ -119,6 +130,18 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
                 <td />
                 <td />
               </tr>
+            ) : r.kind === 'fee' ? (
+              <tr key={i} className="unfunded-row">
+                <td>{fmtDate(r.date)}</td>
+                <td>—</td>
+                <td>
+                  🏦 Overdraft fee
+                  <span className="muted"> · still negative the next night</span>
+                </td>
+                <td className="num danger">−{fmtMoney(r.amount)}</td>
+                <td />
+                <td className="num muted">{fmtMoney(r.balanceAfter)}</td>
+              </tr>
             ) : (
               <tr
                 key={i}
@@ -138,7 +161,12 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
                   )}
                   {r.status === 'late' && <span className="warn">late</span>}
                   {r.status === 'unfunded' && <span className="danger">unfunded</span>}
-                  {r.status === 'overdraft' && <span className="danger">overdraft</span>}
+                  {r.status === 'overdraft' && (
+                    <span className="danger">{r.autopay ? 'overdraft' : 'via overdraft'}</span>
+                  )}
+                  {r.lateFee > 0 && (
+                    <span className="warn"> +{fmtMoney(r.lateFee)} late fee</span>
+                  )}
                 </td>
                 <td className="num muted">{r.balanceAfter != null ? fmtMoney(r.balanceAfter) : ''}</td>
               </tr>

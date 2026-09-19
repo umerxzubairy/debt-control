@@ -26,6 +26,10 @@ export default function App() {
   const totalDebt = state.debts.reduce((s, d) => s + d.balance, 0)
   const nextPayday = plan.paydays[0]
 
+  // how much further below $0 the bank will still let the account go right now
+  const overdraftLimit = state.settings.overdraftLimit ?? 0
+  const overdraftRoom = Math.max(0, overdraftLimit + Math.min(0, state.settings.bankBalance))
+
   // monthly money in vs. out
   const paychecksPerMonth = 365.25 / state.income.frequencyDays / 12
   const monthlyIncome = state.income.payAmount * paychecksPerMonth
@@ -46,6 +50,11 @@ export default function App() {
             label="Bank balance"
             value={fmtMoney(state.settings.bankBalance)}
             tone={state.settings.bankBalance < 0 ? 'bad' : 'good'}
+            sub={
+              overdraftLimit > 0
+                ? `overdraft room ${fmtMoney(overdraftRoom)} of ${fmtMoney(overdraftLimit)}`
+                : undefined
+            }
           />
           <Stat label="Total debt" value={fmtMoney(totalDebt)} tone="neutral" />
           <Stat
@@ -65,6 +74,16 @@ export default function App() {
             value={fmtMoney(plan.totalRequired)}
             tone="neutral"
           />
+          {plan.overdraftFees + plan.lateFees > 0 && (
+            <Stat
+              label="Projected fees (12 wks)"
+              value={fmtMoney(plan.overdraftFees + plan.lateFees)}
+              tone="bad"
+              sub={`overdraft ${fmtMoney(plan.overdraftFees)} · late ${fmtMoney(plan.lateFees)}${
+                plan.peakOverdraft > 0 ? ` · peak overdraft ${fmtMoney(plan.peakOverdraft)}` : ''
+              }`}
+            />
+          )}
           {plan.shortfall > 0 ? (
             <Stat label="Shortfall" value={fmtMoney(plan.shortfall)} tone="bad" />
           ) : (

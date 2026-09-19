@@ -27,7 +27,9 @@ export default function IncomePanel({
         <h3>Bank balance</h3>
         <p className="muted">
           Your real balance right now — negative is fine if you're in overdraft. The plan only
-          schedules payments when this (plus paydays) covers them.
+          schedules payments when this (plus paydays) covers them, unless you allow overdraft
+          below: then it dips into it on the last safe day to beat a due date or a credit-bureau
+          report.
         </p>
         <div className="grid">
           <label>
@@ -58,6 +60,38 @@ export default function IncomePanel({
                 dispatch({
                   type: 'setSettings',
                   settings: { ...settings, bureauReportDays: parseInt(e.target.value) || 30 },
+                })
+              }
+            />
+          </label>
+          <label>
+            Max overdraft allowed ($) — 0 = never go negative
+            <input
+              type="number"
+              step="1"
+              min="0"
+              placeholder="0"
+              value={settings.overdraftLimit || ''}
+              onChange={(e) =>
+                dispatch({
+                  type: 'setSettings',
+                  settings: { ...settings, overdraftLimit: Math.max(0, parseFloat(e.target.value) || 0) },
+                })
+              }
+            />
+          </label>
+          <label>
+            Overdraft fee ($) — if still negative the next night
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              placeholder="0"
+              value={settings.overdraftFee || ''}
+              onChange={(e) =>
+                dispatch({
+                  type: 'setSettings',
+                  settings: { ...settings, overdraftFee: Math.max(0, parseFloat(e.target.value) || 0) },
                 })
               }
             />

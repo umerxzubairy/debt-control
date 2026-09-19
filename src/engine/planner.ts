@@ -1,6 +1,7 @@
 import type {
   AppState,
   Debt,
+  OverdraftFeeEvent,
   Payday,
   PlanResult,
   PlannedPayment,
@@ -11,6 +12,12 @@ import { addDays, daysBetween, nextDueDate, prevDueDate, todayISO } from './date
 /** Planning horizon in days (~6 biweekly paychecks) */
 export const HORIZON_DAYS = 84
 
+/**
+ * Overdraft-funded catch-ups are paid this many days before the creditor's
+ * bureau-reporting date, since card payments can take a couple of days to post.
+ */
+export const BUREAU_SAFETY_DAYS = 2
+
 interface Obligation {
   debtId: string
   debtName: string
@@ -18,7 +25,17 @@ interface Obligation {
   dueDate: string
   /** Earliest date the planner will spend cash on this */
   payableFrom: string
+  /**
+   * Last day to pay without penalty (the due date, or just before the bureau
+   * reports a past-due account). Overdraft is only used on/after this day.
+   * null = never worth overdrafting for.
+   */
+  deadline: string | null
   isPastDueCatchUp: boolean
+  /** Past-due on a bureau-reporting debt: worth an overdraft fee to avoid a report */
+  bureauCritical: boolean
+  /** Fee the lender charges if this lands after dueDate */
+  lateFee: number
   daysUntilReport?: number
   reportsToBureau: boolean
   /** Deducted on dueDate no matter what; never rescheduled */
@@ -39,6 +56,17 @@ interface Obligation {
  * Autopay obligations are the exception: they are fixed-date. They leave the
  * account on their due date regardless of cash (possibly overdrawing it), and
  * flexible payments hold back whatever autopays need before the next inflow.
+ *
+ * Overdraft: when `settings.overdraftLimit` > 0, a flexible payment that cash
+ * can't cover may dip into overdraft — but only on its deadline day (the last
+ * safe moment, so the account is negative as briefly as possible), never past
+ * the limit, and only if that beats the alternative:
+ *  - bureau-critical catch-ups always qualify (a bureau report is the worst outcome)
+ *  - otherwise the overdraft must not cost a fee, or the fee must be smaller
+ *    than the late fee it avoids.
+ * The bank charges `overdraftFee` once per episode when the balance is still
+ * negative on a second consecutive night; the planner looks one day ahead so
+ * overdrafts that clear by the next morning are preferred (no fee).
  */
 export function buildPlan(state: AppState): PlanResult {
   const today = todayISO()
@@ -83,27 +111,73 @@ export function buildPlan(state: AppState): PlanResult {
       .reduce((s, o) => s + o.amount, 0)
   }
 
+  const overdraftLimit = Math.max(0, settings.overdraftLimit ?? 0)
+  const overdraftFee = Math.max(0, settings.overdraftFee ?? 0)
+
   let cash = settings.bankBalance
   let day = today
+  // consecutive nights (end of day) the balance has been below $0
+  let negDays = 0
+  let peakOverdraft = 0
+  let overdraftFees = 0
+  const overdraftFeeEvents: OverdraftFeeEvent[] = []
+
+  // Money movements the plan can't change, used to peek at tomorrow's balance
+  const forcedDelta = (d: string) =>
+    (paydayByDate.get(d) ?? 0) +
+    (oneTimeByDate.get(d) ?? 0) -
+    autopays.filter((o) => o.dueDate === d).reduce((s, o) => s + o.amount, 0)
+
+  // Will the bank charge an overdraft fee if the balance is `cashNow` today?
+  // The fee lands when the balance is negative on a second consecutive night.
+  const feeExpected = (from: string, cashNow: number): boolean => {
+    if (overdraftFee <= 0 || cashNow >= 0 || negDays >= 2) return false
+    if (negDays >= 1) return true // still negative tonight = second night
+    return cashNow + forcedDelta(addDays(from, 1)) < 0
+  }
+
+  const fund = (ob: Obligation, d: string) => {
+    ob.plannedDate = d
+    cash -= ob.amount
+    ob.balanceAfter = round2(cash)
+  }
+
   while (day <= horizonEnd) {
     cash += paydayByDate.get(day) ?? 0
     cash += oneTimeByDate.get(day) ?? 0
     for (const ob of autopays) {
-      if (ob.dueDate !== day) continue
-      ob.plannedDate = day
-      cash -= ob.amount
-      ob.balanceAfter = round2(cash)
+      if (ob.dueDate === day) fund(ob, day)
     }
     const reserve = autopayReserve(day)
     for (const ob of obligations) {
       if (ob.autopay || ob.plannedDate) continue
       if (day < ob.payableFrom) continue
       if (cash - reserve >= ob.amount) {
-        ob.plannedDate = day
-        cash -= ob.amount
-        ob.balanceAfter = round2(cash)
+        fund(ob, day)
+        continue
       }
+      // Cash can't cover it. Is this the last safe day to use overdraft?
+      if (overdraftLimit <= 0 || !ob.deadline) continue
+      if (ob.bureauCritical ? day < ob.deadline : day !== ob.deadline) continue
+      const after = cash - ob.amount
+      const extraFee = feeExpected(day, after) && !feeExpected(day, cash) ? overdraftFee : 0
+      const withinLimit = after - reserve - extraFee >= -overdraftLimit
+      const worthIt = ob.bureauCritical || extraFee === 0 || ob.lateFee > extraFee
+      if (withinLimit && worthIt) fund(ob, day)
     }
+
+    // end of day: overdraft bookkeeping
+    if (cash < 0) {
+      negDays++
+      if (negDays === 2 && overdraftFee > 0) {
+        cash -= overdraftFee
+        overdraftFees += overdraftFee
+        overdraftFeeEvents.push({ date: day, amount: overdraftFee, balanceAfter: round2(cash) })
+      }
+    } else {
+      negDays = 0
+    }
+    peakOverdraft = Math.max(peakOverdraft, -cash)
     day = addDays(day, 1)
   }
 
@@ -118,15 +192,16 @@ export function buildPlan(state: AppState): PlanResult {
     isPastDueCatchUp: ob.isPastDueCatchUp,
     daysUntilReport: ob.daysUntilReport,
     balanceAfter: ob.balanceAfter,
+    lateFee: lateFeeFor(ob),
   }))
 
   const totalRequired = round2(obligations.reduce((s, o) => s + o.amount, 0))
-  // Unfunded payments, plus the part of each autopay that overdraws the account
+  // Unfunded payments, plus the part of each autopay that overdraws past the bank's limit
   const shortfall = round2(
     obligations.reduce((s, o) => {
       if (!o.plannedDate) return s + o.amount
-      if (o.autopay && (o.balanceAfter ?? 0) < 0) {
-        return s + Math.min(o.amount, -(o.balanceAfter ?? 0))
+      if (o.autopay && (o.balanceAfter ?? 0) < -overdraftLimit) {
+        return s + Math.min(o.amount, -(o.balanceAfter ?? 0) - overdraftLimit)
       }
       return s
     }, 0),
@@ -140,7 +215,21 @@ export function buildPlan(state: AppState): PlanResult {
     totalRequired,
     shortfall,
     surplus: shortfall > 0 ? 0 : round2(Math.max(0, cash)),
+    overdraftFees: round2(overdraftFees),
+    overdraftFeeEvents,
+    lateFees: round2(payments.reduce((s, p) => s + p.lateFee, 0)),
+    peakOverdraft: round2(peakOverdraft),
   }
+}
+
+/**
+ * A regular payment that lands after its due date (or never gets funded inside
+ * the horizon) earns the lender's late fee. Catch-ups are already late — that
+ * fee has been charged and belongs in the past-due amount.
+ */
+function lateFeeFor(ob: Obligation): number {
+  if (ob.isPastDueCatchUp || ob.lateFee <= 0) return 0
+  return !ob.plannedDate || ob.plannedDate > ob.dueDate ? ob.lateFee : 0
 }
 
 function buildPaydays(state: AppState, horizonEnd: string): Payday[] {
@@ -188,6 +277,12 @@ function buildObligations(
         amount: Math.min(amount, debt.balance),
         dueDate: since,
         payableFrom: today,
+        // pay a couple of days before the report date so the payment posts in time
+        deadline: debt.reportsToBureau
+          ? maxDate(today, addDays(since, bureauReportDays - 1 - BUREAU_SAFETY_DAYS))
+          : null,
+        bureauCritical: debt.reportsToBureau,
+        lateFee: 0,
         isPastDueCatchUp: true,
         daysUntilReport: debt.reportsToBureau
           ? Math.max(0, bureauReportDays - daysPast)
@@ -214,6 +309,9 @@ function buildObligations(
         dueDate: due,
         // don't tie up cash more than 7 days before the due date
         payableFrom: maxDate(today, addDays(due, -7)),
+        deadline: due,
+        bureauCritical: false,
+        lateFee: debt.lateFee ?? 0,
         isPastDueCatchUp: false,
         reportsToBureau: debt.reportsToBureau,
         autopay: debt.autopay === true,
@@ -243,7 +341,9 @@ function buildPayoffOrder(debts: Debt[], strategy: 'avalanche' | 'snowball') {
 
 function paymentStatus(ob: Obligation): PlannedPayment['status'] {
   if (!ob.plannedDate) return 'unfunded'
-  if (ob.autopay) return (ob.balanceAfter ?? 0) < 0 ? 'overdraft' : 'on_time'
+  // Paid by dipping below $0 — the thing to watch, whether or not it's on time
+  if ((ob.balanceAfter ?? 0) < 0) return 'overdraft'
+  if (ob.autopay) return 'on_time'
   return ob.plannedDate <= ob.dueDate ? 'on_time' : 'late'
 }
 

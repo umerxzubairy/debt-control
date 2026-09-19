@@ -44,6 +44,8 @@ export interface Debt {
    * balance is short (overdraft). Missing/false = manual payment.
    */
   autopay?: boolean
+  /** Fee the lender charges when a payment lands after its due date (0/missing = none) */
+  lateFee?: number
   notes?: string
 }
 
@@ -86,6 +88,10 @@ export interface Settings {
   strategy: Strategy
   /** Days past due at which a creditor typically reports to bureaus */
   bureauReportDays: number
+  /** How far below $0 the bank lets the account go (0 = never plan to overdraw) */
+  overdraftLimit: number
+  /** Fee charged once per overdraft episode if the balance is still negative the next night */
+  overdraftFee: number
 }
 
 export interface AppState {
@@ -100,7 +106,7 @@ export type PlannedStatus =
   | 'on_time' // funded on or before due date
   | 'late' // funded, but after the due date
   | 'unfunded' // no cash available within the planning horizon
-  | 'overdraft' // autopay fires on the due date but the account can't cover it
+  | 'overdraft' // paid on the due date by dipping into overdraft (or autopay overdrawing the account)
 
 export interface PlannedPayment {
   debtId: string
@@ -118,6 +124,15 @@ export interface PlannedPayment {
   daysUntilReport?: number
   /** Projected bank balance after making this payment */
   balanceAfter?: number
+  /** Late fee the lender will charge because this lands after its due date (0 if none) */
+  lateFee: number
+}
+
+/** An overdraft fee the bank charges in the simulation */
+export interface OverdraftFeeEvent {
+  date: string
+  amount: number
+  balanceAfter: number
 }
 
 export interface Payday {
@@ -141,4 +156,11 @@ export interface PlanResult {
   shortfall: number
   /** Leftover cash after the horizon's obligations — available for extra principal payments */
   surplus: number
+  /** Overdraft fees the bank charges in the horizon (deducted from cash) */
+  overdraftFees: number
+  overdraftFeeEvents: OverdraftFeeEvent[]
+  /** Late fees lenders charge for payments landing after their due date (added to balances, not cash) */
+  lateFees: number
+  /** Deepest the bank balance goes below $0 in the horizon (0 if it never does) */
+  peakOverdraft: number
 }

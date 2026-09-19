@@ -164,8 +164,15 @@ function DebtCard({
           >
             {payment.plannedDate ? fmtDateShort(payment.plannedDate) : 'no cash in plan'}
             {payment.status === 'late' && ' (late)'}
-            {payment.status === 'overdraft' && ' (overdraft!)'}
+            {payment.status === 'overdraft' &&
+              (payment.autopay ? ' (overdraft!)' : ' (via overdraft)')}
           </span>
+        </div>
+      )}
+      {payment && payment.lateFee > 0 && (
+        <div className="card-row">
+          <span>Late fee</span>
+          <strong className="warn">{fmtMoney(payment.lateFee)} expected</strong>
         </div>
       )}
       {payment?.daysUntilReport != null && (

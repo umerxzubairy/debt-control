@@ -232,6 +232,19 @@ function DebtForm({
           />
         </label>
         <label>
+          Late fee ($) — charged if paid after the due date
+          <input
+            type="number"
+            step="0.01"
+            min="0"
+            placeholder="0"
+            value={d.lateFee ?? ''}
+            onChange={(e) =>
+              set({ lateFee: e.target.value ? parseFloat(e.target.value) : undefined })
+            }
+          />
+        </label>
+        <label>
           Due day of month
           <input
             required
