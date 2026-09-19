@@ -21,6 +21,8 @@ interface Obligation {
   isPastDueCatchUp: boolean
   daysUntilReport?: number
   reportsToBureau: boolean
+  /** Deducted on dueDate no matter what; never rescheduled */
+  autopay: boolean
   // filled during simulation
   plannedDate: string | null
   balanceAfter?: number
@@ -33,6 +35,10 @@ interface Obligation {
  * everything else by due date. Each day, obligations are funded in priority
  * order from whatever cash is available; an obligation too big for today's
  * cash is retried after each payday.
+ *
+ * Autopay obligations are the exception: they are fixed-date. They leave the
+ * account on their due date regardless of cash (possibly overdrawing it), and
+ * flexible payments hold back whatever autopays need before the next inflow.
  */
 export function buildPlan(state: AppState): PlanResult {
   const today = todayISO()
@@ -63,15 +69,36 @@ export function buildPlan(state: AppState): PlanResult {
     const signed = e.kind === 'in' ? e.amount : -e.amount
     oneTimeByDate.set(e.date, (oneTimeByDate.get(e.date) ?? 0) + signed)
   }
+  const autopays = obligations.filter((o) => o.autopay)
+  const inflowDates = [
+    ...paydays.filter((p) => p.net > 0).map((p) => p.date),
+    ...oneTimes.filter((e) => e.kind === 'in').map((e) => e.date),
+  ].sort()
+  // Cash that autopays still need before more money lands. An inflow on the
+  // same day as an autopay is applied first, so it counts as covering it.
+  const autopayReserve = (from: string) => {
+    const nextInflow = inflowDates.find((d) => d > from) ?? '9999-12-31'
+    return autopays
+      .filter((o) => o.dueDate > from && o.dueDate < nextInflow)
+      .reduce((s, o) => s + o.amount, 0)
+  }
+
   let cash = settings.bankBalance
   let day = today
   while (day <= horizonEnd) {
     cash += paydayByDate.get(day) ?? 0
     cash += oneTimeByDate.get(day) ?? 0
+    for (const ob of autopays) {
+      if (ob.dueDate !== day) continue
+      ob.plannedDate = day
+      cash -= ob.amount
+      ob.balanceAfter = round2(cash)
+    }
+    const reserve = autopayReserve(day)
     for (const ob of obligations) {
-      if (ob.plannedDate) continue
+      if (ob.autopay || ob.plannedDate) continue
       if (day < ob.payableFrom) continue
-      if (cash >= ob.amount) {
+      if (cash - reserve >= ob.amount) {
         ob.plannedDate = day
         cash -= ob.amount
         ob.balanceAfter = round2(cash)
@@ -86,15 +113,23 @@ export function buildPlan(state: AppState): PlanResult {
     amount: round2(ob.amount),
     dueDate: ob.dueDate,
     plannedDate: ob.plannedDate,
-    status: !ob.plannedDate ? 'unfunded' : ob.plannedDate <= ob.dueDate ? 'on_time' : 'late',
+    status: paymentStatus(ob),
+    autopay: ob.autopay,
     isPastDueCatchUp: ob.isPastDueCatchUp,
     daysUntilReport: ob.daysUntilReport,
     balanceAfter: ob.balanceAfter,
   }))
 
   const totalRequired = round2(obligations.reduce((s, o) => s + o.amount, 0))
+  // Unfunded payments, plus the part of each autopay that overdraws the account
   const shortfall = round2(
-    obligations.filter((o) => !o.plannedDate).reduce((s, o) => s + o.amount, 0),
+    obligations.reduce((s, o) => {
+      if (!o.plannedDate) return s + o.amount
+      if (o.autopay && (o.balanceAfter ?? 0) < 0) {
+        return s + Math.min(o.amount, -(o.balanceAfter ?? 0))
+      }
+      return s
+    }, 0),
   )
 
   return {
@@ -158,6 +193,8 @@ function buildObligations(
           ? Math.max(0, bureauReportDays - daysPast)
           : undefined,
         reportsToBureau: debt.reportsToBureau,
+        // a catch-up is a manual payment even on an autopay debt
+        autopay: false,
         plannedDate: null,
       })
     }
@@ -179,6 +216,7 @@ function buildObligations(
         payableFrom: maxDate(today, addDays(due, -7)),
         isPastDueCatchUp: false,
         reportsToBureau: debt.reportsToBureau,
+        autopay: debt.autopay === true,
         plannedDate: null,
       })
       remaining -= amount
@@ -201,6 +239,12 @@ function buildPayoffOrder(debts: Debt[], strategy: 'avalanche' | 'snowball') {
         ? `${d.apr}% APR`
         : `$${d.balance.toLocaleString()} balance`,
   }))
+}
+
+function paymentStatus(ob: Obligation): PlannedPayment['status'] {
+  if (!ob.plannedDate) return 'unfunded'
+  if (ob.autopay) return (ob.balanceAfter ?? 0) < 0 ? 'overdraft' : 'on_time'
+  return ob.plannedDate <= ob.dueDate ? 'on_time' : 'late'
 }
 
 function maxDate(a: string, b: string): string {

@@ -193,6 +193,20 @@ body {
   border-color: var(--danger);
   margin-left: 6px;
 }
+.autopay-pill {
+  color: var(--accent);
+  border-color: var(--accent);
+  margin-left: 6px;
+}
+.pills {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.pills .autopay-pill {
+  margin-left: 0;
+}
 
 .util {
   display: flex;

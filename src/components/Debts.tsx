@@ -15,6 +15,7 @@ const EMPTY: Omit<Debt, 'id'> = {
   dueDay: 1,
   pastDue: false,
   reportsToBureau: true,
+  autopay: false,
 }
 
 export default function Debts({
@@ -67,6 +68,7 @@ export default function Debts({
             <tr key={d.id}>
               <td>
                 <strong>{d.name}</strong>
+                {d.autopay && <span className="pill autopay-pill">autopay</span>}
                 {!d.reportsToBureau && <span className="pill">no bureau</span>}
               </td>
               <td>{DEBT_TYPE_LABELS[d.type]}</td>
@@ -265,7 +267,21 @@ function DebtForm({
           />
           Reports to credit bureau
         </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={d.autopay === true}
+            onChange={(e) => set({ autopay: e.target.checked })}
+          />
+          Autopay
+        </label>
       </div>
+      {d.autopay && (
+        <p className="muted">
+          Deducted automatically on the due date, so the planner can't delay it — it plans
+          your other payments around it and warns you if the account can't cover it.
+        </p>
+      )}
 
       {d.pastDue && (
         <div className="grid">

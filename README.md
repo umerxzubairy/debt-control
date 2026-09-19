@@ -10,6 +10,7 @@ All data lives in your browser's localStorage. No server, no account, no trackin
 
 - **Every kind of debt** — credit cards, personal loans, loans from friends, rent, car lease, or anything else. Mark any of them past due with the amount and missed date.
 - **Automatic minimum payments** — cards use the standard *greater of $35 or 1% of balance + monthly interest* formula; loans use their installment. Override any of them with the real number from your statement.
+- **Autopay** — flag any debt as autopay and the plan treats it as fixed: it leaves your account on the due date no matter what, everything else is planned around it, and you get an overdraft warning if the money won't be there.
 - **Real paychecks** — biweekly/weekly/semi-monthly/monthly pay, earned-wage advances (PayActiv etc.) deducted from your next check, and a living-expenses set-aside so the plan never spends your grocery money.
 - **Works from your real balance** — start from what's actually in your account, even if you're negative in overdraft.
 - **One-time money** — log a bonus, tax refund, or a one-off bill and the plan reflows around it.

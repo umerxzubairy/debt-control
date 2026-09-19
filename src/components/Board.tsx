@@ -61,7 +61,9 @@ export default function Board({
       if (days <= 10) return 'report_risk'
     }
     if (debt.pastDue) return 'past_due'
-    if (p && (p.status === 'late' || p.status === 'unfunded')) return 'needs_money'
+    if (p && (p.status === 'late' || p.status === 'unfunded' || p.status === 'overdraft')) {
+      return 'needs_money'
+    }
     if (p && p.dueDate <= soon) return 'due_soon'
     return 'on_track'
   }
@@ -127,7 +129,10 @@ function DebtCard({
     <div className="card">
       <div className="card-title">
         <strong>{debt.name}</strong>
-        <span className="pill">{DEBT_TYPE_LABELS[debt.type]}</span>
+        <span className="pills">
+          {debt.autopay && <span className="pill autopay-pill">autopay</span>}
+          <span className="pill">{DEBT_TYPE_LABELS[debt.type]}</span>
+        </span>
       </div>
       <div className="card-row">
         <span>Balance</span>
@@ -147,10 +152,19 @@ function DebtCard({
       )}
       {payment && (
         <div className="card-row">
-          <span>Can pay on</span>
-          <span className={payment.status === 'on_time' ? 'ok' : 'warn'}>
+          <span>{payment.autopay ? 'Auto-deducted' : 'Can pay on'}</span>
+          <span
+            className={
+              payment.status === 'on_time'
+                ? 'ok'
+                : payment.status === 'overdraft'
+                  ? 'danger'
+                  : 'warn'
+            }
+          >
             {payment.plannedDate ? fmtDateShort(payment.plannedDate) : 'no cash in plan'}
             {payment.status === 'late' && ' (late)'}
+            {payment.status === 'overdraft' && ' (overdraft!)'}
           </span>
         </div>
       )}

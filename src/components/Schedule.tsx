@@ -1,4 +1,4 @@
-import type { AppState, PlanResult } from '../types'
+import type { AppState, PlanResult, PlannedStatus } from '../types'
 import { fmtMoney } from '../format'
 import { fmtDate } from '../engine/dates'
 
@@ -17,7 +17,8 @@ type Row =
       dueDate: string
       name: string
       amount: number
-      status: 'on_time' | 'late' | 'unfunded'
+      status: PlannedStatus
+      autopay: boolean
       isPastDueCatchUp: boolean
       balanceAfter?: number
     }
@@ -45,6 +46,7 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
       name: p.debtName,
       amount: p.amount,
       status: p.status,
+      autopay: p.autopay,
       isPastDueCatchUp: p.isPastDueCatchUp,
       balanceAfter: p.balanceAfter,
     })),
@@ -118,18 +120,25 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
                 <td />
               </tr>
             ) : (
-              <tr key={i} className={r.status === 'unfunded' ? 'unfunded-row' : ''}>
+              <tr
+                key={i}
+                className={r.status === 'unfunded' || r.status === 'overdraft' ? 'unfunded-row' : ''}
+              >
                 <td>{r.date ? fmtDate(r.date) : '— no cash —'}</td>
                 <td>{fmtDate(r.dueDate)}</td>
                 <td>
                   {r.name}
                   {r.isPastDueCatchUp && <span className="pill danger-pill">catch-up</span>}
+                  {r.autopay && <span className="pill autopay-pill">autopay</span>}
                 </td>
                 <td className="num">{fmtMoney(r.amount)}</td>
                 <td>
-                  {r.status === 'on_time' && <span className="ok">on time</span>}
+                  {r.status === 'on_time' && (
+                    <span className="ok">{r.autopay ? 'auto-deducted' : 'on time'}</span>
+                  )}
                   {r.status === 'late' && <span className="warn">late</span>}
                   {r.status === 'unfunded' && <span className="danger">unfunded</span>}
+                  {r.status === 'overdraft' && <span className="danger">overdraft</span>}
                 </td>
                 <td className="num muted">{r.balanceAfter != null ? fmtMoney(r.balanceAfter) : ''}</td>
               </tr>

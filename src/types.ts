@@ -38,6 +38,12 @@ export interface Debt {
   pastDueSince?: string
   /** Friend loans and some debts never report to credit bureaus */
   reportsToBureau: boolean
+  /**
+   * Automatically deducted from the bank account on each due date. The planner
+   * can't delay these — they leave the account on the due date even if the
+   * balance is short (overdraft). Missing/false = manual payment.
+   */
+  autopay?: boolean
   notes?: string
 }
 
@@ -94,6 +100,7 @@ export type PlannedStatus =
   | 'on_time' // funded on or before due date
   | 'late' // funded, but after the due date
   | 'unfunded' // no cash available within the planning horizon
+  | 'overdraft' // autopay fires on the due date but the account can't cover it
 
 export interface PlannedPayment {
   debtId: string
@@ -104,6 +111,8 @@ export interface PlannedPayment {
   /** The date we can actually pay it, given cash flow. May be after dueDate. */
   plannedDate: string | null
   status: PlannedStatus
+  /** Fixed-date automatic deduction: plannedDate always equals dueDate */
+  autopay: boolean
   isPastDueCatchUp: boolean
   /** Days until the past-due amount hits the bureau reporting threshold (only for past-due, reporting debts) */
   daysUntilReport?: number

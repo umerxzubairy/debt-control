@@ -22,6 +22,7 @@ npm run build    # tsc -b && vite build (use this as the type-check gate)
 
 - `type: 'rent'` is special-cased as **recurring** in the planner (monthly forever) and excluded from payoff order; every other debt's obligations stop when the balance runs out.
 - `reportsToBureau: false` (friend loans, rent) → no bureau-risk column/countdown.
+- `autopay: true` makes a debt's *regular cycle* payments **fixed-date**: the planner deducts them on `dueDate` unconditionally (status `on_time`, or `overdraft` if the balance goes negative — the overdrawn part counts toward `shortfall`), and flexible payments hold back `autopayReserve()` = autopay amounts due before the next inflow. Past-due catch-ups on an autopay debt stay manual. Nothing auto-mutates state when the date passes — the user still records payments/bank balance themselves (their entered balance already reflects real deductions).
 - The kanban columns are *derived* from `PlanResult` per debt, not stored state.
 - `recordPayment` reduces debt balance **and** bank balance, and clears past-due as the catch-up amount is covered.
 
