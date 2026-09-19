@@ -170,10 +170,24 @@ function DebtCard({
         </div>
       )}
       {payment?.missesBureau && (
-        <div className="card-row">
-          <span>🚨 Bureau</span>
-          <strong className="danger">reported before this can be paid</strong>
-        </div>
+        <>
+          <div className="card-row">
+            <span>🚨 Bureau</span>
+            <strong className="danger">reported before this can be paid</strong>
+          </div>
+          {payment.bureauGap != null && (
+            <p className="tip danger">
+              Still about <strong>{fmtMoney(payment.bureauGap)}</strong> short even if no other
+              bill were paid — add that much to save it.
+              {payment.bureauPaidFirst && payment.bureauPaidFirst.length > 0 && (
+                <span className="muted">
+                  {' '}
+                  Meanwhile the money that's left goes to {payment.bureauPaidFirst.join(', ')}.
+                </span>
+              )}
+            </p>
+          )}
+        </>
       )}
       {payment?.advanceRequestDate && (
         <div className="card-row">

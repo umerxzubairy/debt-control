@@ -173,6 +173,10 @@ export interface PlannedPayment {
   advanceRequestDate?: string
   /** A past-due catch-up that the plan cannot pay before the creditor reports it to the bureaus */
   missesBureau: boolean
+  /** When missesBureau: about how much more money it would take to save it, if no other bill were paid */
+  bureauGap?: number
+  /** When missesBureau: the other bills the plan pays before this one's deadline with the money that's left */
+  bureauPaidFirst?: string[]
 }
 
 /** A pay advance the planner decided to take */

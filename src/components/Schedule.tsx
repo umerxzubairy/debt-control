@@ -33,6 +33,7 @@ type Row =
       autopay: boolean
       lateFee: number
       missesBureau: boolean
+      bureauGap?: number
       isPastDueCatchUp: boolean
       balanceAfter?: number
     }
@@ -80,6 +81,7 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
       autopay: p.autopay,
       lateFee: p.lateFee,
       missesBureau: p.missesBureau,
+      bureauGap: p.bureauGap,
       isPastDueCatchUp: p.isPastDueCatchUp,
       balanceAfter: p.balanceAfter,
     })),
@@ -214,7 +216,13 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
                   {r.lateFee > 0 && (
                     <span className="warn"> +{fmtMoney(r.lateFee)} late fee</span>
                   )}
-                  {r.missesBureau && <span className="danger"> 🚨 after bureau report date</span>}
+                  {r.missesBureau && (
+                    <span className="danger">
+                      {' '}
+                      🚨 after bureau report date
+                      {r.bureauGap != null && ` · ~${fmtMoney(r.bureauGap)} short`}
+                    </span>
+                  )}
                 </td>
                 <td className="num muted">{r.balanceAfter != null ? fmtMoney(r.balanceAfter) : ''}</td>
               </tr>
