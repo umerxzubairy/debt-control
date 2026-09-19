@@ -171,6 +171,8 @@ export interface PlannedPayment {
   lateFee: number
   /** Set when a pay advance was planned to fund this on time: the day to request it */
   advanceRequestDate?: string
+  /** A past-due catch-up that the plan cannot pay before the creditor reports it to the bureaus */
+  missesBureau: boolean
 }
 
 /** A pay advance the planner decided to take */

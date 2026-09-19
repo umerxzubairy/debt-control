@@ -169,6 +169,12 @@ function DebtCard({
           </span>
         </div>
       )}
+      {payment?.missesBureau && (
+        <div className="card-row">
+          <span>🚨 Bureau</span>
+          <strong className="danger">reported before this can be paid</strong>
+        </div>
+      )}
       {payment?.advanceRequestDate && (
         <div className="card-row">
           <span>⚡ Pay advance</span>

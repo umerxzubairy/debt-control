@@ -48,6 +48,8 @@ interface Obligation {
   isPastDueCatchUp: boolean
   /** Past-due on a bureau-reporting debt: worth an overdraft fee to avoid a report */
   bureauCritical: boolean
+  /** The day the creditor reports this past-due account to the bureaus */
+  reportDate: string | null
   /** Fee the lender charges if this lands after dueDate */
   lateFee: number
   daysUntilReport?: number
@@ -150,9 +152,34 @@ export function buildPlan(state: AppState): PlanResult {
       advances = better.advances
       sim = better.sim
     }
+
+    // Advances requested the same day arrive together and come out of the same
+    // check, so they only need one transfer — and one fee.
+    const merged = mergeSameDay(advances)
+    if (merged.length < advances.length) {
+      const mergedSim = simulate(ctx, merged)
+      if (score(ctx, mergedSim, merged) <= score(ctx, sim, advances)) {
+        advances = merged
+        sim = mergedSim
+      }
+    }
   }
 
   return toResult(ctx, sim, advances)
+}
+
+function mergeSameDay(advances: AdvanceReq[]): AdvanceReq[] {
+  const byDay = new Map<string, AdvanceReq>()
+  for (const a of advances) {
+    const seen = byDay.get(a.requestDate)
+    byDay.set(
+      a.requestDate,
+      seen
+        ? { ...seen, amount: seen.amount + a.amount, forDebts: [...seen.forDebts, ...a.forDebts] }
+        : a,
+    )
+  }
+  return [...byDay.values()]
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +258,53 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
     ob.balanceAfter = round2(cash)
   }
 
+  // --- protecting payments that must beat a bureau report ---
+  // Money you can count on by a future day: today's balance, the forced money
+  // movements in between, and the overdraft room. Prefix sums make "what lands
+  // between today and D" a subtraction.
+  const days: string[] = []
+  for (let d = today; d <= horizonEnd; d = addDays(d, 1)) days.push(d)
+  const dayIndex = new Map(days.map((d, i) => [d, i]))
+  const cumFlow: number[] = []
+  days.reduce((run, d) => {
+    const next = run + forcedDelta(d)
+    cumFlow.push(next)
+    return next
+  }, 0)
+  const flowBetween = (from: string, to: string) =>
+    (cumFlow[dayIndex.get(to > horizonEnd ? horizonEnd : to) ?? 0] ?? 0) -
+    (cumFlow[dayIndex.get(from) ?? 0] ?? 0)
+  // Order in which unpaid bureau-critical catch-ups need their money
+  const criticalOrder = obligations
+    .filter((o) => o.bureauCritical && !o.autopay)
+    .map((o, i) => ({ o, i }))
+    .sort((a, b) => (a.o.deadline ?? '').localeCompare(b.o.deadline ?? '') || a.i - b.i)
+    .map((x) => x.o)
+
+  /**
+   * Would paying `x` today still leave enough (cash + inflows before its
+   * deadline + overdraft room) for every more urgent bureau-critical catch-up
+   * that could be paid at all? Otherwise the overdraft room and cash get eaten
+   * by bills that only cost a late fee while an account heads for the bureaus.
+   */
+  const roomForBureau = (x: Obligation, from: string): boolean => {
+    let committed = 0
+    for (const y of criticalOrder) {
+      if (y === x) break // only catch-ups more urgent than x matter to x
+      if (y.plannedDate) continue
+      const by = (y.deadline ?? from) < from ? from : (y.deadline ?? from)
+      const flows = flowBetween(from, by)
+      // room = balance + inflows + overdraft. Using overdraft may cost a fee — unless
+      // this overdraft episode has already been charged (it's charged once).
+      const room = (balance: number, need: number) =>
+        balance + flows + overdraftLimit - (balance + flows < need && negDays < 2 ? overdraftFee : 0)
+      if (committed + y.amount > room(cash, committed + y.amount)) continue // can't be paid anyway
+      committed += y.amount
+      if (room(cash - x.amount, committed) < committed) return false
+    }
+    return true
+  }
+
   while (day <= horizonEnd) {
     cash += paydayByDate.get(day) ?? 0
     cash += oneTimeByDate.get(day) ?? 0
@@ -242,21 +316,35 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
     for (const ob of obligations) {
       if (ob.autopay || ob.plannedDate) continue
       if (day < ob.payableFrom) continue
-      if (cash - reserve >= ob.amount) {
+      const affordable = cash - reserve >= ob.amount
+      if (affordable && roomForBureau(ob, day)) {
         fund(ob, day)
         continue
       }
-      // Cash can't cover it. Is this the last safe day to borrow for it?
+      // Not paid from cash: either it can't cover it, or the cash is being held
+      // for a bureau-critical catch-up. Is this the last safe day to borrow for it?
       const deadline = ob.deadline
       if (deadline === null) continue
       if (ob.bureauCritical ? day < deadline : day !== deadline) continue
-      if (ob.shortBy === undefined) ob.shortBy = ob.amount - (cash - reserve)
+      // A payment about to be reported beats the autopay hold-back: if the cash is
+      // there, use it (a later autopay may then overdraw, which the plan flags).
+      if (ob.bureauCritical && cash >= ob.amount && roomForBureau(ob, day)) {
+        fund(ob, day)
+        continue
+      }
+      if (ob.shortBy === undefined) {
+        // held-back cash means a pay advance would have to cover the whole payment
+        ob.shortBy = affordable ? ob.amount : ob.amount - (cash - reserve)
+      }
       if (overdraftLimit <= 0) continue
       const after = cash - ob.amount
       const extraFee = feeExpected(day, after) && !feeExpected(day, cash) ? overdraftFee : 0
-      const withinLimit = after - reserve - extraFee >= -overdraftLimit
+      // Same rule for overdraft room: honour the autopay hold-back unless that would
+      // leave a payment headed for the bureaus unpaid.
+      const holdBack = ob.bureauCritical && after - reserve - extraFee < -overdraftLimit ? 0 : reserve
+      const withinLimit = after - holdBack - extraFee >= -overdraftLimit
       const worthIt = ob.bureauCritical || extraFee === 0 || ob.lateFee > extraFee
-      if (withinLimit && worthIt) fund(ob, day)
+      if (withinLimit && worthIt && roomForBureau(ob, day)) fund(ob, day)
     }
 
     // end of day: overdraft bookkeeping
@@ -409,7 +497,13 @@ function improveWithAdvance(
   const candidates = sim.obligations
     .map((ob, i) => ({ ob, i }))
     .filter(({ ob }) => needsAdvance(ob, sim) && !skipped.has(obligationKey(ob)))
-    .sort((a, b) => (a.ob.deadline ?? '').localeCompare(b.ob.deadline ?? '') || a.i - b.i)
+    // Payments headed for a bureau report get first call on the advance limit
+    .sort(
+      (a, b) =>
+        Number(b.ob.bureauCritical) - Number(a.ob.bureauCritical) ||
+        (a.ob.deadline ?? '').localeCompare(b.ob.deadline ?? '') ||
+        a.i - b.i,
+    )
 
   for (const { ob } of candidates) {
     const deadline = ob.deadline as string
@@ -484,6 +578,10 @@ function toResult(ctx: Ctx, sim: Sim, advances: AdvanceReq[]): PlanResult {
     daysUntilReport: ob.daysUntilReport,
     balanceAfter: ob.balanceAfter,
     lateFee: lateFeeFor(ob),
+    missesBureau:
+      ob.bureauCritical &&
+      ob.reportDate !== null &&
+      (!ob.plannedDate || ob.plannedDate >= ob.reportDate),
     advanceRequestDate: ob.autopay
       ? undefined
       : plannedAdvances.find(
@@ -556,6 +654,7 @@ function buildObligations(
           ? maxDate(today, addDays(since, bureauReportDays - 1 - BUREAU_SAFETY_DAYS))
           : null,
         bureauCritical: debt.reportsToBureau,
+        reportDate: debt.reportsToBureau ? addDays(since, bureauReportDays) : null,
         lateFee: 0,
         isPastDueCatchUp: true,
         daysUntilReport: debt.reportsToBureau
@@ -585,6 +684,7 @@ function buildObligations(
         payableFrom: maxDate(today, addDays(due, -7)),
         deadline: due,
         bureauCritical: false,
+        reportDate: null,
         lateFee: debt.lateFee ?? 0,
         isPastDueCatchUp: false,
         reportsToBureau: debt.reportsToBureau,
