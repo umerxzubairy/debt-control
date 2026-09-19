@@ -405,6 +405,30 @@ select:focus {
   margin: 10px 0;
   flex-wrap: wrap;
 }
+.paychecks {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 8px;
+}
+.paychecks > p {
+  margin: 0;
+}
+.paycheck-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+.paycheck-row label {
+  width: 160px;
+}
+.preset-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
 .advance-list {
   list-style: none;
   padding: 0;

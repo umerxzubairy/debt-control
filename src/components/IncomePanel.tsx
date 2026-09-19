@@ -3,7 +3,8 @@ import type { AppState } from '../types'
 import type { Action } from '../store'
 import { uid } from '../store'
 import { fmtMoney } from '../format'
-import { fmtDate, todayISO } from '../engine/dates'
+import { addDays, fmtDate, todayISO } from '../engine/dates'
+import { buildPaychecks } from '../engine/paychecks'
 
 export default function IncomePanel({
   state,
@@ -14,6 +15,10 @@ export default function IncomePanel({
 }) {
   const { income, settings } = state
   const advancesTotal = income.advances.reduce((s, a) => s + a.amount, 0)
+  const nextPayDate = buildPaychecks(income, todayISO(), addDays(todayISO(), 62))[0]?.date
+  const adv = state.advance
+  const setAdv = (patch: Partial<typeof adv>) =>
+    dispatch({ type: 'setAdvance', advance: { ...adv, ...patch } })
   const [advAmount, setAdvAmount] = useState('')
   const [advNote, setAdvNote] = useState('')
   const [otAmount, setOtAmount] = useState('')
@@ -118,15 +123,44 @@ export default function IncomePanel({
             />
           </label>
           <label>
-            Next payday
-            <input
-              type="date"
-              value={income.nextPayDate}
-              onChange={(e) =>
-                dispatch({ type: 'setIncome', income: { ...income, nextPayDate: e.target.value } })
-              }
-            />
+            Pay schedule
+            <select
+              value={income.scheduleKind}
+              onChange={(e) => {
+                const scheduleKind = e.target.value as 'interval' | 'monthly'
+                dispatch({
+                  type: 'setIncome',
+                  income: {
+                    ...income,
+                    scheduleKind,
+                    // start from the common 1st/15th pattern rather than an empty list
+                    monthlyPaychecks:
+                      scheduleKind === 'monthly' && income.monthlyPaychecks.length === 0
+                        ? [
+                            { payDay: 1, periodStartDay: 8, periodEndDay: 23 },
+                            { payDay: 15, periodStartDay: 23, periodEndDay: 8 },
+                          ]
+                        : income.monthlyPaychecks,
+                  },
+                })
+              }}
+            >
+              <option value="interval">Every N days</option>
+              <option value="monthly">Fixed days each month</option>
+            </select>
           </label>
+          {income.scheduleKind === 'interval' && (
+            <label>
+              Next payday
+              <input
+                type="date"
+                value={income.nextPayDate}
+                onChange={(e) =>
+                  dispatch({ type: 'setIncome', income: { ...income, nextPayDate: e.target.value } })
+                }
+              />
+            </label>
+          )}
           <label>
             Living expenses per paycheck ($) — groceries, gas, etc.
             <input
@@ -143,31 +177,128 @@ export default function IncomePanel({
               }
             />
           </label>
-          <label>
-            Pay frequency
-            <select
-              value={income.frequencyDays}
-              onChange={(e) =>
-                dispatch({
-                  type: 'setIncome',
-                  income: { ...income, frequencyDays: parseInt(e.target.value) },
-                })
-              }
-            >
-              <option value={7}>Weekly</option>
-              <option value={14}>Biweekly (every 2 weeks)</option>
-              <option value={15}>Semi-monthly (~15 days)</option>
-              <option value={30}>Monthly</option>
-            </select>
-          </label>
+          {income.scheduleKind === 'interval' && (
+            <>
+              <label>
+                Pay frequency
+                <select
+                  value={income.frequencyDays}
+                  onChange={(e) =>
+                    dispatch({
+                      type: 'setIncome',
+                      income: { ...income, frequencyDays: parseInt(e.target.value) },
+                    })
+                  }
+                >
+                  <option value={7}>Weekly</option>
+                  <option value={14}>Biweekly (every 2 weeks)</option>
+                  <option value={15}>Semi-monthly (~15 days)</option>
+                  <option value={30}>Monthly</option>
+                </select>
+              </label>
+              <label>
+                Days between period end and payday
+                <input
+                  type="number"
+                  min="0"
+                  value={income.periodLagDays}
+                  onChange={(e) =>
+                    dispatch({
+                      type: 'setIncome',
+                      income: { ...income, periodLagDays: Math.max(0, parseInt(e.target.value) || 0) },
+                    })
+                  }
+                />
+              </label>
+            </>
+          )}
         </div>
+
+        {income.scheduleKind === 'monthly' && (
+          <div className="paychecks">
+            <p className="muted">
+              One row per paycheck each month: the day you're paid, and the days of the month its
+              work period runs from and to. Example: paid the <strong>1st</strong> for the{' '}
+              <strong>8th → 23rd</strong>, and the <strong>15th</strong> for the{' '}
+              <strong>23rd → 8th</strong>. The work period decides how much you can advance.
+            </p>
+            {income.monthlyPaychecks.map((p, i) => (
+              <div className="paycheck-row" key={i}>
+                {(
+                  [
+                    ['Paid on day', 'payDay'],
+                    ['Work period from day', 'periodStartDay'],
+                    ['…to day', 'periodEndDay'],
+                  ] as const
+                ).map(([label, key]) => (
+                  <label key={key}>
+                    {label}
+                    <input
+                      type="number"
+                      min="1"
+                      max="31"
+                      value={p[key]}
+                      onChange={(e) =>
+                        dispatch({
+                          type: 'setIncome',
+                          income: {
+                            ...income,
+                            monthlyPaychecks: income.monthlyPaychecks.map((x, j) =>
+                              j === i
+                                ? { ...x, [key]: Math.min(31, Math.max(1, parseInt(e.target.value) || 1)) }
+                                : x,
+                            ),
+                          },
+                        })
+                      }
+                    />
+                  </label>
+                ))}
+                <button
+                  className="btn small ghost"
+                  onClick={() =>
+                    dispatch({
+                      type: 'setIncome',
+                      income: {
+                        ...income,
+                        monthlyPaychecks: income.monthlyPaychecks.filter((_, j) => j !== i),
+                      },
+                    })
+                  }
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+            <div>
+              <button
+                className="btn small"
+                onClick={() =>
+                  dispatch({
+                    type: 'setIncome',
+                    income: {
+                      ...income,
+                      monthlyPaychecks: [
+                        ...income.monthlyPaychecks,
+                        { payDay: 1, periodStartDay: 1, periodEndDay: 15 },
+                      ],
+                    },
+                  })
+                }
+              >
+                + Add paycheck
+              </button>
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="panel">
-        <h3>PayActiv advances</h3>
+        <h3>Advances already taken</h3>
         <p className="muted">
-          Money you already pulled early — it's deducted from your <strong>next</strong> paycheck
-          ({income.nextPayDate ? fmtDate(income.nextPayDate) : 'not set'}). Total right now:{' '}
+          Money you already pulled early with PayActiv — it's deducted from your{' '}
+          <strong>next</strong> paycheck ({nextPayDate ? fmtDate(nextPayDate) : 'not set'}). Total
+          right now:{' '}
           <strong>{fmtMoney(advancesTotal)}</strong>
           {income.payAmount > 0 && (
             <>
@@ -227,6 +358,98 @@ export default function IncomePanel({
           ))}
           {income.advances.length === 0 && <li className="muted">None recorded.</li>}
         </ul>
+      </section>
+
+      <section className="panel">
+        <h3>Pay advance planning (PayActiv)</h3>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={adv.enabled}
+            onChange={(e) => setAdv({ enabled: e.target.checked })}
+          />
+          Let the plan take pay advances to make payments on time
+        </label>
+        <p className="muted">
+          When a payment would otherwise be late — or cost an overdraft fee — the plan requests an
+          advance on the last safe day, for just what's missing. It comes out of your next
+          paycheck with the fee, and the plan only keeps an advance if that leaves you better off
+          overall. Your employer sets the real limits and fees, so check them in the PayActiv app.
+        </p>
+        <div className="preset-row">
+          <button
+            className="btn small"
+            onClick={() => setAdv({ fee: 3, leadDays: 0 })}
+            title="Money arrives instantly for a $3 flat fee"
+          >
+            Preset: instant, $3 flat fee
+          </button>
+          <button
+            className="btn small"
+            onClick={() => setAdv({ fee: 0, leadDays: 3 })}
+            title="Bank (ACH) transfers are free but take 1–3 business days"
+          >
+            Preset: bank transfer (free, ~3 days)
+          </button>
+        </div>
+        <div className="grid">
+          <label>
+            Fee per advance ($) — fixed
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              value={adv.fee}
+              onChange={(e) => setAdv({ fee: Math.max(0, parseFloat(e.target.value) || 0) })}
+            />
+          </label>
+          <label>
+            Days until the money arrives (0 = instant)
+            <input
+              type="number"
+              min="0"
+              max="10"
+              value={adv.leadDays}
+              onChange={(e) =>
+                setAdv({ leadDays: Math.min(10, Math.max(0, parseInt(e.target.value) || 0)) })
+              }
+            />
+          </label>
+          <label>
+            Max per pay period (% of your paycheck)
+            <input
+              type="number"
+              min="1"
+              max="100"
+              value={adv.maxPercent}
+              onChange={(e) =>
+                setAdv({ maxPercent: Math.min(100, Math.max(1, parseFloat(e.target.value) || 50)) })
+              }
+            />
+          </label>
+        </div>
+        <p className="muted">
+          {income.payAmount > 0 ? (
+            <>
+              That's up to <strong>{fmtMoney((income.payAmount * adv.maxPercent) / 100)}</strong>{' '}
+              advanced per pay period. The limit resets when a paycheck repays what you took.
+            </>
+          ) : (
+            <>Set your net pay above to see the dollar limit.</>
+          )}
+        </p>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={adv.limitToEarned}
+            onChange={(e) => setAdv({ limitToEarned: e.target.checked })}
+          />
+          Only allow that share of wages earned so far (the limit grows day by day)
+        </label>
+        <p className="muted">
+          Turn this on if the PayActiv app shows you less early in a pay period. Off, the plan
+          assumes the full limit is available any day.
+        </p>
       </section>
 
       <section className="panel">

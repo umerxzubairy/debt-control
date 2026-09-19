@@ -1,5 +1,13 @@
 import { useEffect, useReducer } from 'react'
-import type { AppState, Debt, Income, OneTimeEvent, PayAdvance, Settings } from './types'
+import type {
+  AdvanceSettings,
+  AppState,
+  Debt,
+  Income,
+  OneTimeEvent,
+  PayAdvance,
+  Settings,
+} from './types'
 import { todayISO } from './engine/dates'
 
 const STORAGE_KEY = 'debt-control-v1'
@@ -8,11 +16,22 @@ export const initialState: AppState = {
   debts: [],
   income: {
     payAmount: 0,
+    scheduleKind: 'interval',
     nextPayDate: todayISO(),
     frequencyDays: 14,
+    periodLagDays: 7,
+    monthlyPaychecks: [],
     advances: [],
     livingExpenses: 0,
     oneTimes: [],
+  },
+  advance: {
+    enabled: false,
+    // $3 flat fee, money arrives instantly, up to half a paycheck per pay period
+    fee: 3,
+    leadDays: 0,
+    maxPercent: 50,
+    limitToEarned: false,
   },
   settings: {
     bankBalance: 0,
@@ -35,6 +54,7 @@ export type Action =
   | { type: 'addOneTime'; event: OneTimeEvent }
   | { type: 'removeOneTime'; id: string }
   | { type: 'setSettings'; settings: Settings }
+  | { type: 'setAdvance'; advance: AdvanceSettings }
   | { type: 'importState'; state: AppState }
 
 export function reducer(state: AppState, action: Action): AppState {
@@ -99,22 +119,42 @@ export function reducer(state: AppState, action: Action): AppState {
       }
     case 'setSettings':
       return { ...state, settings: action.settings }
+    case 'setAdvance':
+      return { ...state, advance: action.advance }
     case 'importState':
-      return action.state
+      return normalizeState(action.state)
   }
+}
+
+/**
+ * Fill in defaults for fields added after the data was saved. Used for both
+ * localStorage and imported backups, so older data keeps working.
+ */
+export function normalizeState(parsed: Partial<AppState>): AppState {
+  return {
+    ...initialState,
+    ...parsed,
+    income: { ...initialState.income, ...parsed.income },
+    settings: { ...initialState.settings, ...parsed.settings },
+    advance: { ...initialState.advance, ...migrateAdvance(parsed.advance) },
+  }
+}
+
+/** Drop settings saved by the first version of the pay-advance model. */
+function migrateAdvance(saved?: Partial<AdvanceSettings> & { maxOutstanding?: number }) {
+  if (!saved) return {}
+  const { maxOutstanding, ...rest } = saved
+  // That version guessed a $3.49 fee and a $500 cap. Only an untouched old default is
+  // replaced; the real setup is a $3 fee with a per-pay-period limit.
+  if (maxOutstanding !== undefined && rest.fee === 3.49) delete rest.fee
+  return rest
 }
 
 function load(): AppState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return initialState
-    const parsed = JSON.parse(raw) as AppState
-    return {
-      ...initialState,
-      ...parsed,
-      income: { ...initialState.income, ...parsed.income },
-      settings: { ...initialState.settings, ...parsed.settings },
-    }
+    return normalizeState(JSON.parse(raw) as Partial<AppState>)
   } catch {
     return initialState
   }

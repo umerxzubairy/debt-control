@@ -65,12 +65,29 @@ export interface OneTimeEvent {
   note?: string
 }
 
+/**
+ * One paycheck in a fixed-days-per-month schedule, e.g. paid on the 1st for
+ * work from the 8th to the 23rd. Period days are days of the month; the period
+ * is the most recent one that ends before payday.
+ */
+export interface MonthlyPaycheck {
+  payDay: number
+  periodStartDay: number
+  periodEndDay: number
+}
+
 export interface Income {
   /** Net take-home per paycheck before advances */
   payAmount: number
-  /** ISO date of the next payday */
+  /** 'interval' = every `frequencyDays` days; 'monthly' = fixed days of the month */
+  scheduleKind: 'interval' | 'monthly'
+  /** ISO date of the next payday (interval schedule) */
   nextPayDate: string
   frequencyDays: number
+  /** Interval schedule: days between the end of a pay period and its payday */
+  periodLagDays: number
+  /** Monthly schedule: one entry per paycheck each month */
+  monthlyPaychecks: MonthlyPaycheck[]
   /** PayActiv (or similar) advances to be deducted from the next paycheck */
   advances: PayAdvance[]
   /** Groceries and other living costs set aside from every paycheck */
@@ -94,10 +111,36 @@ export interface Settings {
   overdraftFee: number
 }
 
+/**
+ * Earned-wage-access (PayActiv etc.): take part of wages you've earned but not
+ * been paid yet. The amount plus a fixed fee comes out of your next paycheck.
+ * Employers set the limits and fees, so all of these are configurable.
+ */
+export interface AdvanceSettings {
+  /** Let the planner take advances to make payments on time */
+  enabled: boolean
+  /** Fixed fee per advance (0 for a free bank transfer) */
+  fee: number
+  /** Days from requesting an advance to the money being in your account (0 = instant, ~3 = bank transfer) */
+  leadDays: number
+  /**
+   * Most you can have advanced per pay period, as a % of one paycheck's net pay
+   * (50 = half your salary). It resets when a paycheck repays what was advanced.
+   */
+  maxPercent: number
+  /**
+   * Also limit advances to that % of the wages earned so far (the balance grows
+   * day by day through the pay period). Off = the full per-period limit is
+   * available any time.
+   */
+  limitToEarned: boolean
+}
+
 export interface AppState {
   debts: Debt[]
   income: Income
   settings: Settings
+  advance: AdvanceSettings
 }
 
 // ---- Planner output ----
@@ -126,6 +169,21 @@ export interface PlannedPayment {
   balanceAfter?: number
   /** Late fee the lender will charge because this lands after its due date (0 if none) */
   lateFee: number
+  /** Set when a pay advance was planned to fund this on time: the day to request it */
+  advanceRequestDate?: string
+}
+
+/** A pay advance the planner decided to take */
+export interface PlannedAdvance {
+  requestDate: string
+  /** When the money is in your account (requestDate + lead days) */
+  arrivalDate: string
+  amount: number
+  fee: number
+  /** The payday whose check it comes out of (null = after the planning horizon) */
+  repayDate: string | null
+  /** Names of the debts it helps pay */
+  forDebts: string[]
 }
 
 /** An overdraft fee the bank charges in the simulation */
@@ -141,6 +199,9 @@ export interface Payday {
   advancesDeducted: number
   livingDeducted: number
   net: number
+  /** The work period this check pays for (used to work out advance availability) */
+  periodStart: string
+  periodEnd: string
 }
 
 export interface PlanResult {
@@ -163,4 +224,8 @@ export interface PlanResult {
   lateFees: number
   /** Deepest the bank balance goes below $0 in the horizon (0 if it never does) */
   peakOverdraft: number
+  /** Pay advances the plan takes to make payments on time */
+  advances: PlannedAdvance[]
+  /** Total fees on those advances (deducted from paychecks) */
+  advanceFees: number
 }

@@ -31,7 +31,10 @@ export default function App() {
   const overdraftRoom = Math.max(0, overdraftLimit + Math.min(0, state.settings.bankBalance))
 
   // monthly money in vs. out
-  const paychecksPerMonth = 365.25 / state.income.frequencyDays / 12
+  const paychecksPerMonth =
+    state.income.scheduleKind === 'monthly'
+      ? state.income.monthlyPaychecks.length
+      : 365.25 / state.income.frequencyDays / 12
   const monthlyIncome = state.income.payAmount * paychecksPerMonth
   const monthlyLiving = (state.income.livingExpenses ?? 0) * paychecksPerMonth
   const monthlyMinimums = state.debts
@@ -74,14 +77,19 @@ export default function App() {
             value={fmtMoney(plan.totalRequired)}
             tone="neutral"
           />
-          {plan.overdraftFees + plan.lateFees > 0 && (
+          {plan.overdraftFees + plan.lateFees + plan.advanceFees > 0 && (
             <Stat
               label="Projected fees (12 wks)"
-              value={fmtMoney(plan.overdraftFees + plan.lateFees)}
+              value={fmtMoney(plan.overdraftFees + plan.lateFees + plan.advanceFees)}
               tone="bad"
-              sub={`overdraft ${fmtMoney(plan.overdraftFees)} · late ${fmtMoney(plan.lateFees)}${
-                plan.peakOverdraft > 0 ? ` · peak overdraft ${fmtMoney(plan.peakOverdraft)}` : ''
-              }`}
+              sub={[
+                plan.overdraftFees > 0 && `overdraft ${fmtMoney(plan.overdraftFees)}`,
+                plan.lateFees > 0 && `late ${fmtMoney(plan.lateFees)}`,
+                plan.advanceFees > 0 && `advance ${fmtMoney(plan.advanceFees)}`,
+                plan.peakOverdraft > 0 && `peak overdraft ${fmtMoney(plan.peakOverdraft)}`,
+              ]
+                .filter(Boolean)
+                .join(' · ')}
             />
           )}
           {plan.shortfall > 0 ? (

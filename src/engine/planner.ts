@@ -1,13 +1,16 @@
 import type {
   AppState,
   Debt,
+  OneTimeEvent,
   OverdraftFeeEvent,
   Payday,
   PlanResult,
+  PlannedAdvance,
   PlannedPayment,
 } from '../types'
 import { cycleMinimum } from './minPayment'
 import { addDays, daysBetween, nextDueDate, prevDueDate, todayISO } from './dates'
+import { advanceAvailable, buildPaychecks, type Paycheck } from './paychecks'
 
 /** Planning horizon in days (~6 biweekly paychecks) */
 export const HORIZON_DAYS = 84
@@ -18,6 +21,17 @@ export const HORIZON_DAYS = 84
  */
 export const BUREAU_SAFETY_DAYS = 2
 
+/**
+ * What a late payment is assumed to cost when the debt has no late fee set —
+ * used only to decide whether a pay-advance fee is worth paying to be on time.
+ */
+export const LATE_PENALTY = 50
+
+/** Cost of letting a past-due account reach the bureau-reporting date */
+const BUREAU_PENALTY = 1_000_000
+
+const MAX_ADVANCE_ROUNDS = 30
+
 interface Obligation {
   debtId: string
   debtName: string
@@ -27,8 +41,8 @@ interface Obligation {
   payableFrom: string
   /**
    * Last day to pay without penalty (the due date, or just before the bureau
-   * reports a past-due account). Overdraft is only used on/after this day.
-   * null = never worth overdrafting for.
+   * reports a past-due account). Overdraft and advances are only used on/after
+   * this day. null = never worth borrowing for.
    */
   deadline: string | null
   isPastDueCatchUp: boolean
@@ -43,6 +57,36 @@ interface Obligation {
   // filled during simulation
   plannedDate: string | null
   balanceAfter?: number
+  /** How much cash was missing on the deadline day (drives pay-advance sizing) */
+  shortBy?: number
+}
+
+/** A pay advance the planner is considering / has decided to take */
+interface AdvanceReq {
+  requestDate: string
+  amount: number
+  forDebts: string[]
+}
+
+interface Ctx {
+  state: AppState
+  today: string
+  horizonEnd: string
+  /** Paychecks through a pay period past the horizon, so availability near its end is right */
+  paychecks: Paycheck[]
+  oneTimes: OneTimeEvent[]
+  overdraftLimit: number
+  overdraftFee: number
+}
+
+interface Sim {
+  obligations: Obligation[]
+  paydays: Payday[]
+  /** Bank balance at the end of the horizon */
+  cash: number
+  overdraftFees: number
+  feeEvents: OverdraftFeeEvent[]
+  peakOverdraft: number
 }
 
 /**
@@ -67,14 +111,57 @@ interface Obligation {
  * The bank charges `overdraftFee` once per episode when the balance is still
  * negative on a second consecutive night; the planner looks one day ahead so
  * overdrafts that clear by the next morning are preferred (no fee).
+ *
+ * Pay advances: when `advance.enabled`, payments that would still be late (or
+ * cost an overdraft fee) get a pay advance requested `leadDays` before their
+ * deadline, sized to the missing cash, if the employer's limits allow it. Each
+ * candidate advance is tried by re-running the whole simulation and kept only
+ * if the plan gets cheaper overall — the advance and its fee come out of the
+ * next paycheck, which can squeeze later payments. Nearby needs top up an
+ * existing advance instead of paying a second fee.
  */
 export function buildPlan(state: AppState): PlanResult {
   const today = todayISO()
   const horizonEnd = addDays(today, HORIZON_DAYS)
-  const { debts, settings } = state
+  const { settings } = state
 
-  const paydays = buildPaydays(state, horizonEnd)
-  const obligations = buildObligations(debts, settings.bureauReportDays, today, horizonEnd)
+  const oneTimes = state.income.oneTimes
+    .filter((e) => e.date >= today && e.date <= horizonEnd && e.amount > 0)
+    .sort((a, b) => a.date.localeCompare(b.date))
+
+  const ctx: Ctx = {
+    state,
+    today,
+    horizonEnd,
+    paychecks: buildPaychecks(state.income, today, addDays(horizonEnd, 45)),
+    oneTimes,
+    overdraftLimit: Math.max(0, settings.overdraftLimit ?? 0),
+    overdraftFee: Math.max(0, settings.overdraftFee ?? 0),
+  }
+
+  let advances: AdvanceReq[] = []
+  let sim = simulate(ctx, advances)
+
+  if (state.advance.enabled) {
+    const skipped = new Set<string>()
+    for (let round = 0; round < MAX_ADVANCE_ROUNDS; round++) {
+      const better = improveWithAdvance(ctx, advances, sim, skipped)
+      if (!better) break
+      advances = better.advances
+      sim = better.sim
+    }
+  }
+
+  return toResult(ctx, sim, advances)
+}
+
+// ---------------------------------------------------------------------------
+// Cash simulation
+// ---------------------------------------------------------------------------
+
+function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
+  const { state, today, horizonEnd, overdraftLimit, overdraftFee } = ctx
+  const obligations = buildObligations(state.debts, state.settings.bureauReportDays, today, horizonEnd)
 
   // --- priority order ---
   obligations.sort((a, b) => {
@@ -87,20 +174,24 @@ export function buildPlan(state: AppState): PlanResult {
     return a.dueDate.localeCompare(b.dueDate)
   })
 
-  // --- simulate cash day by day ---
+  const paydays = buildPaydays(ctx, advances)
   const paydayByDate = new Map(paydays.map((p) => [p.date, p.net]))
-  const oneTimes = state.income.oneTimes
-    .filter((e) => e.date >= today && e.date <= horizonEnd && e.amount > 0)
-    .sort((a, b) => a.date.localeCompare(b.date))
   const oneTimeByDate = new Map<string, number>()
-  for (const e of oneTimes) {
+  for (const e of ctx.oneTimes) {
     const signed = e.kind === 'in' ? e.amount : -e.amount
     oneTimeByDate.set(e.date, (oneTimeByDate.get(e.date) ?? 0) + signed)
   }
+  const arrivalByDate = new Map<string, number>()
+  for (const a of advances) {
+    const arrives = addDays(a.requestDate, state.advance.leadDays)
+    arrivalByDate.set(arrives, (arrivalByDate.get(arrives) ?? 0) + a.amount)
+  }
+
   const autopays = obligations.filter((o) => o.autopay)
   const inflowDates = [
     ...paydays.filter((p) => p.net > 0).map((p) => p.date),
-    ...oneTimes.filter((e) => e.kind === 'in').map((e) => e.date),
+    ...ctx.oneTimes.filter((e) => e.kind === 'in').map((e) => e.date),
+    ...arrivalByDate.keys(),
   ].sort()
   // Cash that autopays still need before more money lands. An inflow on the
   // same day as an autopay is applied first, so it counts as covering it.
@@ -111,21 +202,19 @@ export function buildPlan(state: AppState): PlanResult {
       .reduce((s, o) => s + o.amount, 0)
   }
 
-  const overdraftLimit = Math.max(0, settings.overdraftLimit ?? 0)
-  const overdraftFee = Math.max(0, settings.overdraftFee ?? 0)
-
-  let cash = settings.bankBalance
+  let cash = state.settings.bankBalance
   let day = today
   // consecutive nights (end of day) the balance has been below $0
   let negDays = 0
   let peakOverdraft = 0
   let overdraftFees = 0
-  const overdraftFeeEvents: OverdraftFeeEvent[] = []
+  const feeEvents: OverdraftFeeEvent[] = []
 
   // Money movements the plan can't change, used to peek at tomorrow's balance
   const forcedDelta = (d: string) =>
     (paydayByDate.get(d) ?? 0) +
-    (oneTimeByDate.get(d) ?? 0) -
+    (oneTimeByDate.get(d) ?? 0) +
+    (arrivalByDate.get(d) ?? 0) -
     autopays.filter((o) => o.dueDate === d).reduce((s, o) => s + o.amount, 0)
 
   // Will the bank charge an overdraft fee if the balance is `cashNow` today?
@@ -145,6 +234,7 @@ export function buildPlan(state: AppState): PlanResult {
   while (day <= horizonEnd) {
     cash += paydayByDate.get(day) ?? 0
     cash += oneTimeByDate.get(day) ?? 0
+    cash += arrivalByDate.get(day) ?? 0
     for (const ob of autopays) {
       if (ob.dueDate === day) fund(ob, day)
     }
@@ -156,9 +246,12 @@ export function buildPlan(state: AppState): PlanResult {
         fund(ob, day)
         continue
       }
-      // Cash can't cover it. Is this the last safe day to use overdraft?
-      if (overdraftLimit <= 0 || !ob.deadline) continue
-      if (ob.bureauCritical ? day < ob.deadline : day !== ob.deadline) continue
+      // Cash can't cover it. Is this the last safe day to borrow for it?
+      const deadline = ob.deadline
+      if (deadline === null) continue
+      if (ob.bureauCritical ? day < deadline : day !== deadline) continue
+      if (ob.shortBy === undefined) ob.shortBy = ob.amount - (cash - reserve)
+      if (overdraftLimit <= 0) continue
       const after = cash - ob.amount
       const extraFee = feeExpected(day, after) && !feeExpected(day, cash) ? overdraftFee : 0
       const withinLimit = after - reserve - extraFee >= -overdraftLimit
@@ -172,7 +265,7 @@ export function buildPlan(state: AppState): PlanResult {
       if (negDays === 2 && overdraftFee > 0) {
         cash -= overdraftFee
         overdraftFees += overdraftFee
-        overdraftFeeEvents.push({ date: day, amount: overdraftFee, balanceAfter: round2(cash) })
+        feeEvents.push({ date: day, amount: overdraftFee, balanceAfter: round2(cash) })
       }
     } else {
       negDays = 0
@@ -180,6 +273,204 @@ export function buildPlan(state: AppState): PlanResult {
     peakOverdraft = Math.max(peakOverdraft, -cash)
     day = addDays(day, 1)
   }
+
+  return { obligations, paydays, cash, overdraftFees, feeEvents, peakOverdraft }
+}
+
+/**
+ * Paydays inside the horizon, net of what comes out of each check: money owed
+ * from pay advances (repaid from the first payday after the advance, carrying
+ * over if a check can't cover it all) and the living-expenses set-aside.
+ */
+function buildPaydays(ctx: Ctx, advances: AdvanceReq[]): Payday[] {
+  const { income } = ctx.state
+  const fee = ctx.state.advance.fee
+  const living = income.livingExpenses ?? 0
+  // advances already taken and recorded by the user come out of the next check
+  let owed = income.advances.reduce((s, a) => s + a.amount, 0)
+  const counted = new Set<AdvanceReq>()
+  const paydays: Payday[] = []
+  for (const p of ctx.paychecks) {
+    if (p.date > ctx.horizonEnd) break
+    for (const a of advances) {
+      if (!counted.has(a) && a.requestDate < p.date) {
+        owed += a.amount + fee
+        counted.add(a)
+      }
+    }
+    const deducted = Math.min(owed, income.payAmount)
+    owed -= deducted
+    const livingDeducted = Math.min(living, Math.max(0, income.payAmount - deducted))
+    paydays.push({
+      date: p.date,
+      gross: income.payAmount,
+      advancesDeducted: round2(deducted),
+      livingDeducted: round2(livingDeducted),
+      net: round2(income.payAmount - deducted - livingDeducted),
+      periodStart: p.periodStart,
+      periodEnd: p.periodEnd,
+    })
+  }
+  return paydays
+}
+
+// ---------------------------------------------------------------------------
+// Pay advances
+// ---------------------------------------------------------------------------
+
+const obligationKey = (ob: Obligation) => `${ob.debtId}|${ob.dueDate}|${ob.isPastDueCatchUp}`
+
+/** Paid too late to avoid its penalty (late fee / bureau report)? */
+function missed(ob: Obligation): boolean {
+  if (ob.isPastDueCatchUp) {
+    return ob.bureauCritical && (!ob.plannedDate || ob.plannedDate > (ob.deadline ?? ob.dueDate))
+  }
+  return !ob.plannedDate || ob.plannedDate > ob.dueDate
+}
+
+/** Lower is better. Fees are real dollars; a missed payment costs its late fee (or an assumed penalty). */
+function score(ctx: Ctx, sim: Sim, advances: AdvanceReq[]): number {
+  let s = sim.overdraftFees + advances.length * ctx.state.advance.fee + sim.peakOverdraft * 0.05
+  for (const ob of sim.obligations) {
+    if (ob.autopay || !missed(ob)) continue
+    if (ob.isPastDueCatchUp) s += BUREAU_PENALTY
+    else s += ob.lateFee > 0 ? ob.lateFee : LATE_PENALTY
+  }
+  return s
+}
+
+/** Could a pay advance have helped this obligation? */
+function needsAdvance(ob: Obligation, sim: Sim): boolean {
+  if (ob.autopay || ob.deadline === null || ob.shortBy === undefined) return false
+  const viaOverdraft = (ob.balanceAfter ?? 0) < 0
+  return missed(ob) || (viaOverdraft && sim.overdraftFees > 0)
+}
+
+/** First payday after `a` was requested, i.e. the check the advance comes out of */
+function repayDateFor(ctx: Ctx, a: AdvanceReq): string | null {
+  return ctx.paychecks.find((p) => p.date > a.requestDate)?.date ?? null
+}
+
+/** Advance principal outstanding on `on`, from advances requested earlier (`before`) and those the user recorded */
+function outstandingOn(ctx: Ctx, before: AdvanceReq[], on: string): number {
+  const first = ctx.paychecks[0]?.date
+  const recorded =
+    first === undefined || on < first
+      ? ctx.state.income.advances.reduce((s, a) => s + a.amount, 0)
+      : 0
+  return (
+    recorded +
+    before
+      .filter((b) => {
+        const repay = repayDateFor(ctx, b)
+        return repay === null || repay > on
+      })
+      .reduce((s, b) => s + b.amount, 0)
+  )
+}
+
+function availableOn(ctx: Ctx, before: AdvanceReq[], on: string): number {
+  return advanceAvailable(
+    ctx.paychecks,
+    ctx.state.income.payAmount,
+    ctx.state.advance,
+    on,
+    outstandingOn(ctx, before, on),
+  )
+}
+
+/** Does every advance stay within what the employer would allow on its request date? */
+function advancesValid(ctx: Ctx, advances: AdvanceReq[]): boolean {
+  const order = advances
+    .map((a, i) => ({ a, i }))
+    .sort((x, y) => x.a.requestDate.localeCompare(y.a.requestDate) || x.i - y.i)
+  for (let k = 0; k < order.length; k++) {
+    const { a } = order[k]
+    if (a.requestDate < ctx.today) return false
+    const earlier = order.slice(0, k).map((o) => o.a)
+    if (a.amount > availableOn(ctx, earlier, a.requestDate) + 1e-9) return false
+  }
+  return true
+}
+
+/**
+ * Try to fix the most urgent payment that a pay advance could rescue. Returns
+ * the improved advances + simulation, or null when nothing helps.
+ */
+function improveWithAdvance(
+  ctx: Ctx,
+  advances: AdvanceReq[],
+  sim: Sim,
+  skipped: Set<string>,
+): { advances: AdvanceReq[]; sim: Sim } | null {
+  const lead = ctx.state.advance.leadDays
+  const base = score(ctx, sim, advances)
+
+  const candidates = sim.obligations
+    .map((ob, i) => ({ ob, i }))
+    .filter(({ ob }) => needsAdvance(ob, sim) && !skipped.has(obligationKey(ob)))
+    .sort((a, b) => (a.ob.deadline ?? '').localeCompare(b.ob.deadline ?? '') || a.i - b.i)
+
+  for (const { ob } of candidates) {
+    const deadline = ob.deadline as string
+    const need = Math.ceil(ob.shortBy ?? 0)
+    const request = addDays(deadline, -lead)
+    const options: AdvanceReq[][] = []
+
+    if (request >= ctx.today && need > 0) {
+      // Top up an advance that's already out and still unpaid on this deadline:
+      // one fee instead of two.
+      advances.forEach((a, idx) => {
+        const repay = repayDateFor(ctx, a)
+        const arrives = addDays(a.requestDate, lead)
+        if (arrives <= deadline && (repay === null || repay > deadline)) {
+          const next = advances.map((x, j) =>
+            j === idx ? { ...x, amount: x.amount + need, forDebts: [...x.forDebts, ob.debtName] } : x,
+          )
+          if (advancesValid(ctx, next)) options.push(next)
+        }
+      })
+      // A new advance, trimmed to what's available that day
+      const amount = Math.min(need, Math.floor(availableOn(ctx, advances, request)))
+      if (amount >= 1) {
+        const next = [...advances, { requestDate: request, amount, forDebts: [ob.debtName] }]
+        if (advancesValid(ctx, next)) options.push(next)
+      }
+    }
+
+    let best: { advances: AdvanceReq[]; sim: Sim; score: number } | null = null
+    for (const next of options) {
+      const nextSim = simulate(ctx, next)
+      const nextScore = score(ctx, nextSim, next)
+      if (nextScore < base - 1e-6 && (!best || nextScore < best.score)) {
+        best = { advances: next, sim: nextSim, score: nextScore }
+      }
+    }
+    if (best) return best
+    skipped.add(obligationKey(ob))
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// Result assembly
+// ---------------------------------------------------------------------------
+
+function toResult(ctx: Ctx, sim: Sim, advances: AdvanceReq[]): PlanResult {
+  const { state, overdraftLimit } = ctx
+  const { obligations, paydays, cash, overdraftFees, feeEvents, peakOverdraft } = sim
+  const adv = state.advance
+
+  const plannedAdvances: PlannedAdvance[] = advances
+    .map((a) => ({
+      requestDate: a.requestDate,
+      arrivalDate: addDays(a.requestDate, adv.leadDays),
+      amount: a.amount,
+      fee: adv.fee,
+      repayDate: repayDateFor(ctx, a),
+      forDebts: [...new Set(a.forDebts)],
+    }))
+    .sort((a, b) => a.requestDate.localeCompare(b.requestDate))
 
   const payments: PlannedPayment[] = obligations.map((ob) => ({
     debtId: ob.debtId,
@@ -193,6 +484,11 @@ export function buildPlan(state: AppState): PlanResult {
     daysUntilReport: ob.daysUntilReport,
     balanceAfter: ob.balanceAfter,
     lateFee: lateFeeFor(ob),
+    advanceRequestDate: ob.autopay
+      ? undefined
+      : plannedAdvances.find(
+          (a) => a.forDebts.includes(ob.debtName) && ob.plannedDate && a.arrivalDate <= ob.plannedDate,
+        )?.requestDate,
   }))
 
   const totalRequired = round2(obligations.reduce((s, o) => s + o.amount, 0))
@@ -210,15 +506,17 @@ export function buildPlan(state: AppState): PlanResult {
   return {
     payments,
     paydays,
-    oneTimes,
-    payoffOrder: buildPayoffOrder(debts, settings.strategy),
+    oneTimes: ctx.oneTimes,
+    payoffOrder: buildPayoffOrder(state.debts, state.settings.strategy),
     totalRequired,
     shortfall,
     surplus: shortfall > 0 ? 0 : round2(Math.max(0, cash)),
     overdraftFees: round2(overdraftFees),
-    overdraftFeeEvents,
+    overdraftFeeEvents: feeEvents,
     lateFees: round2(payments.reduce((s, p) => s + p.lateFee, 0)),
     peakOverdraft: round2(peakOverdraft),
+    advances: plannedAdvances,
+    advanceFees: round2(plannedAdvances.reduce((s, a) => s + a.fee, 0)),
   }
 }
 
@@ -230,30 +528,6 @@ export function buildPlan(state: AppState): PlanResult {
 function lateFeeFor(ob: Obligation): number {
   if (ob.isPastDueCatchUp || ob.lateFee <= 0) return 0
   return !ob.plannedDate || ob.plannedDate > ob.dueDate ? ob.lateFee : 0
-}
-
-function buildPaydays(state: AppState, horizonEnd: string): Payday[] {
-  const { income } = state
-  const paydays: Payday[] = []
-  if (!income.nextPayDate || income.payAmount <= 0) return paydays
-  const advancesTotal = income.advances.reduce((s, a) => s + a.amount, 0)
-  const living = income.livingExpenses ?? 0
-  let date = income.nextPayDate
-  let first = true
-  while (date <= horizonEnd) {
-    const deducted = first ? Math.min(advancesTotal, income.payAmount) : 0
-    const livingDeducted = Math.min(living, Math.max(0, income.payAmount - deducted))
-    paydays.push({
-      date,
-      gross: income.payAmount,
-      advancesDeducted: round2(deducted),
-      livingDeducted: round2(livingDeducted),
-      net: round2(income.payAmount - deducted - livingDeducted),
-    })
-    date = addDays(date, income.frequencyDays)
-    first = false
-  }
-  return paydays
 }
 
 function buildObligations(
@@ -324,6 +598,14 @@ function buildObligations(
   return obligations
 }
 
+function paymentStatus(ob: Obligation): PlannedPayment['status'] {
+  if (!ob.plannedDate) return 'unfunded'
+  // Paid by dipping below $0 — the thing to watch, whether or not it's on time
+  if ((ob.balanceAfter ?? 0) < 0) return 'overdraft'
+  if (ob.autopay) return 'on_time'
+  return ob.plannedDate <= ob.dueDate ? 'on_time' : 'late'
+}
+
 function buildPayoffOrder(debts: Debt[], strategy: 'avalanche' | 'snowball') {
   // Rent is a recurring bill, not a payable-off debt
   const active = debts.filter((d) => d.balance > 0 && d.type !== 'rent')
@@ -337,14 +619,6 @@ function buildPayoffOrder(debts: Debt[], strategy: 'avalanche' | 'snowball') {
         ? `${d.apr}% APR`
         : `$${d.balance.toLocaleString()} balance`,
   }))
-}
-
-function paymentStatus(ob: Obligation): PlannedPayment['status'] {
-  if (!ob.plannedDate) return 'unfunded'
-  // Paid by dipping below $0 — the thing to watch, whether or not it's on time
-  if ((ob.balanceAfter ?? 0) < 0) return 'overdraft'
-  if (ob.autopay) return 'on_time'
-  return ob.plannedDate <= ob.dueDate ? 'on_time' : 'late'
 }
 
 function maxDate(a: string, b: string): string {

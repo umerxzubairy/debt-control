@@ -169,6 +169,12 @@ function DebtCard({
           </span>
         </div>
       )}
+      {payment?.advanceRequestDate && (
+        <div className="card-row">
+          <span>⚡ Pay advance</span>
+          <strong className="ok">request {fmtDateShort(payment.advanceRequestDate)}</strong>
+        </div>
+      )}
       {payment && payment.lateFee > 0 && (
         <div className="card-row">
           <span>Late fee</span>
