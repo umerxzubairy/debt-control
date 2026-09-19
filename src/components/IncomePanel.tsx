@@ -432,7 +432,7 @@ export default function IncomePanel({
           {income.payAmount > 0 ? (
             <>
               That's up to <strong>{fmtMoney((income.payAmount * adv.maxPercent) / 100)}</strong>{' '}
-              advanced per pay period. The limit resets when a paycheck repays what you took.
+              advanced per pay period. Each pay period gets its own fresh limit when it starts, even if what you took earlier isn't repaid yet.
             </>
           ) : (
             <>Set your net pay above to see the dollar limit.</>

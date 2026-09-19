@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useDeferredValue, useMemo, useState } from 'react'
 import { useAppState } from './store'
 import { buildPlan } from './engine/planner'
 import { cycleMinimum } from './engine/minPayment'
@@ -21,7 +21,10 @@ const TABS: { id: Tab; label: string }[] = [
 export default function App() {
   const { state, dispatch } = useAppState()
   const [tab, setTab] = useState<Tab>(state.debts.length === 0 ? 'income' : 'board')
-  const plan = useMemo(() => buildPlan(state), [state])
+  // The plan searches many advance combinations and can take a few hundred ms on a
+  // busy account; computing it from a deferred copy keeps typing responsive.
+  const deferredState = useDeferredValue(state)
+  const plan = useMemo(() => buildPlan(deferredState), [deferredState])
 
   const totalDebt = state.debts.reduce((s, d) => s + d.balance, 0)
   const nextPayday = plan.paydays[0]

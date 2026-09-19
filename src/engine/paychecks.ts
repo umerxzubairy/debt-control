@@ -63,9 +63,26 @@ export function unpaidEarned(paychecks: Paycheck[], payAmount: number, on: strin
 }
 
 /**
- * How much more can be advanced on a given day: the per-pay-period limit (a
- * share of one paycheck's net pay) minus what's already out — and, if
- * `limitToEarned` is on, no more than that share of the wages earned so far.
+ * The pay period a date falls in (the paycheck that pays for it), or undefined
+ * for a date outside every known period. Where periods share a boundary day the
+ * one that starts on it wins, i.e. the new period.
+ */
+export function periodOf(paychecks: Paycheck[], on: string): Paycheck | undefined {
+  let found: Paycheck | undefined
+  for (const p of paychecks) {
+    if (p.periodStart <= on && on <= p.periodEnd && (!found || p.periodStart > found.periodStart)) {
+      found = p
+    }
+  }
+  return found
+}
+
+/**
+ * How much more can be advanced on a given day. Every pay period has its own
+ * limit — a share of one paycheck's net pay — that starts fresh when the period
+ * starts, whether or not earlier advances have been repaid yet. `outstanding` is
+ * what has already been taken in *this* period. If `limitToEarned` is on, it's
+ * also no more than that share of the wages earned so far in the period.
  */
 export function advanceAvailable(
   paychecks: Paycheck[],
@@ -74,9 +91,11 @@ export function advanceAvailable(
   on: string,
   outstanding: number,
 ): number {
+  const period = periodOf(paychecks, on) ?? paychecks.find((p) => p.date > on)
+  if (!period) return 0
   const perPeriod = (adv.maxPercent / 100) * payAmount
   const limit = adv.limitToEarned
-    ? Math.min(perPeriod, (adv.maxPercent / 100) * unpaidEarned(paychecks, payAmount, on))
+    ? Math.min(perPeriod, (adv.maxPercent / 100) * earnedNet(period, payAmount, on))
     : perPeriod
   return Math.max(0, limit - outstanding)
 }

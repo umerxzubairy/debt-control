@@ -10,7 +10,7 @@ import type {
 } from '../types'
 import { cycleMinimum } from './minPayment'
 import { addDays, daysBetween, nextDueDate, prevDueDate, todayISO } from './dates'
-import { advanceAvailable, buildPaychecks, type Paycheck } from './paychecks'
+import { advanceAvailable, buildPaychecks, periodOf, type Paycheck } from './paychecks'
 
 /** Planning horizon in days (~6 biweekly paychecks) */
 export const HORIZON_DAYS = 84
@@ -30,7 +30,16 @@ export const LATE_PENALTY = 50
 /** Cost of letting a past-due account reach the bureau-reporting date */
 const BUREAU_PENALTY = 1_000_000
 
-const MAX_ADVANCE_ROUNDS = 30
+/** How many rounds of "add the single best advance" to try, and how many urgent payments to consider per round */
+const MAX_ADVANCE_ROUNDS = 14
+const MAX_CANDIDATES = 4
+/** How many needy payments the second (chain) search draws its candidate days from */
+const MAX_BACKWARD_PAYMENTS = 10
+/** How many times the chain search re-expands its candidate days from the plan it just found */
+const MAX_CHAIN_PASSES = 3
+
+/** Paid after the safety-margin deadline but still before the bureau report date: a risk, not a report */
+const SAFETY_PENALTY = 200
 
 interface Obligation {
   debtId: string
@@ -61,6 +70,8 @@ interface Obligation {
   balanceAfter?: number
   /** How much cash was missing on the deadline day (drives pay-advance sizing) */
   shortBy?: number
+  /** The least an advance would have to add for the overdraft room to cover the rest */
+  shortMin?: number
   /** For a catch-up that can't be saved: extra money it would take, if nothing else were paid */
   bureauGap?: number
 }
@@ -147,12 +158,49 @@ export function buildPlan(state: AppState): PlanResult {
   let sim = simulate(ctx, advances)
 
   if (state.advance.enabled) {
-    const skipped = new Set<string>()
+    const baseSim = sim
     for (let round = 0; round < MAX_ADVANCE_ROUNDS; round++) {
-      const better = improveWithAdvance(ctx, advances, sim, skipped)
+      const better = improveWithAdvance(ctx, advances, sim)
       if (!better) break
       advances = better.advances
       sim = better.sim
+    }
+    // Also try the chain approach (start with everything, remove what doesn't help)
+    // and keep whichever plan is better.
+    let chain = backwardAdvances(ctx, baseSim)
+    // Taking advances shrinks later paychecks, which can leave new payments short: look
+    // again from the plan we ended up with, until it stops improving.
+    for (let pass = 0; chain && pass < MAX_CHAIN_PASSES; pass++) {
+      const more = backwardAdvances(ctx, chain.sim, chain.advances)
+      if (!more || score(ctx, more.sim, more.advances) >= score(ctx, chain.sim, chain.advances) - 1e-6) break
+      chain = more
+    }
+    if (chain && score(ctx, chain.sim, chain.advances) < score(ctx, sim, advances)) {
+      advances = chain.advances
+      sim = chain.sim
+      // the chain can still leave a gap one more advance would close
+      for (let round = 0; round < MAX_ADVANCE_ROUNDS; round++) {
+        const better = improveWithAdvance(ctx, advances, sim)
+        if (!better) break
+        advances = better.advances
+        sim = better.sim
+      }
+    }
+    ;({ advances, sim } = pruneAdvances(ctx, advances, sim))
+    ;({ advances, sim } = shrinkAdvances(ctx, advances, sim))
+    // Shrinking frees up room in each pay period's limit, which the first search can
+    // now use on other days (a chain that grabbed a whole limit on one day, say).
+    let polished = false
+    for (let round = 0; round < MAX_ADVANCE_ROUNDS; round++) {
+      const better = improveWithAdvance(ctx, advances, sim)
+      if (!better) break
+      advances = better.advances
+      sim = better.sim
+      polished = true
+    }
+    if (polished) {
+      ;({ advances, sim } = pruneAdvances(ctx, advances, sim))
+      ;({ advances, sim } = shrinkAdvances(ctx, advances, sim))
     }
 
     // Advances requested the same day arrive together and come out of the same
@@ -295,6 +343,30 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
     }
     bestAhead.set(y, best)
   }
+  // Pay advances the plan could still take before each catch-up's last day: every
+  // pay period offers what's left of its limit. Counting them (not just the ones
+  // already decided) is what keeps money held back for a catch-up that an advance
+  // will rescue — otherwise a bill paid today makes the advance pointless tomorrow.
+  const lead = state.advance.leadDays
+  const advPotential = new Map<Obligation, number[]>()
+  if (state.advance.enabled) {
+    for (const y of criticalOrder) {
+      const lastDay = y.reportDate ? addDays(y.reportDate, -1) : horizonEnd
+      const parts: { d: string; amount: number }[] = []
+      for (const p of ctx.paychecks) {
+        const latest = addDays(lastDay, -lead)
+        const d = latest < p.periodEnd ? latest : p.periodEnd
+        if (d < today || d < p.periodStart) continue
+        const amount = Math.floor(availableOn(ctx, advances, d))
+        if (amount >= 1) parts.push({ d, amount })
+      }
+      advPotential.set(
+        y,
+        days.map((day) => parts.filter((part) => part.d >= day).reduce((s, part) => s + part.amount, 0)),
+      )
+    }
+  }
+
   /** Is this catch-up still unpaid with a chance to beat its bureau report? */
   const savableOn = (o: Obligation, dayI: number) =>
     !o.plannedDate && (bestAhead.get(o)?.[dayI] ?? -Infinity) !== -Infinity
@@ -319,9 +391,9 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
       }
       const best = bestAhead.get(y)?.[fromI] ?? -Infinity
       if (y.plannedDate || best === -Infinity) continue
-      const flows = best - cumFlow[fromI]
-      // room = balance + inflows + overdraft. Using overdraft may cost a fee — unless
-      // this overdraft episode has already been charged (it's charged once).
+      const flows = best - cumFlow[fromI] + (advPotential.get(y)?.[fromI] ?? 0)
+      // room = balance + inflows (+ advances still possible) + overdraft. Using overdraft
+      // may cost a fee — unless this overdraft episode has already been charged.
       const room = (balance: number, need: number) =>
         balance + flows + overdraftLimit - (balance + flows < need && negDays < 2 ? overdraftFee : 0)
       const need = committed + y.amount
@@ -374,6 +446,7 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
       if (ob.shortBy === undefined) {
         // held-back cash means a pay advance would have to cover the whole payment
         ob.shortBy = affordable ? ob.amount : ob.amount - (cash - reserve)
+        ob.shortMin = ob.amount - (cash - reserve + overdraftLimit)
       }
       if (overdraftLimit <= 0) continue
       const after = cash - ob.amount
@@ -445,8 +518,6 @@ function buildPaydays(ctx: Ctx, advances: AdvanceReq[]): Payday[] {
 // Pay advances
 // ---------------------------------------------------------------------------
 
-const obligationKey = (ob: Obligation) => `${ob.debtId}|${ob.dueDate}|${ob.isPastDueCatchUp}`
-
 /** Paid too late to avoid its penalty (late fee / bureau report)? */
 function missed(ob: Obligation): boolean {
   if (ob.isPastDueCatchUp) {
@@ -455,13 +526,30 @@ function missed(ob: Obligation): boolean {
   return !ob.plannedDate || ob.plannedDate > ob.dueDate
 }
 
+/**
+ * What a past-due account costs: a bureau report if it isn't paid before its report
+ * date (and when not everything can be saved, the one reported first is the one to
+ * save), or a small penalty for cutting it inside the safety margin.
+ */
+function bureauCost(ctx: Ctx, ob: Obligation): number {
+  if (!ob.reportDate) return 0
+  if (!ob.plannedDate || ob.plannedDate >= ob.reportDate) {
+    const daysAway = Math.max(0, daysBetween(ctx.today, ob.reportDate))
+    return BUREAU_PENALTY + Math.max(0, HORIZON_DAYS - daysAway) * 10
+  }
+  return ob.deadline && ob.plannedDate > ob.deadline ? SAFETY_PENALTY : 0
+}
+
 /** Lower is better. Fees are real dollars; a missed payment costs its late fee (or an assumed penalty). */
-function score(ctx: Ctx, sim: Sim, advances: AdvanceReq[]): number {
-  let s = sim.overdraftFees + advances.length * ctx.state.advance.fee + sim.peakOverdraft * 0.05
+function score(ctx: Ctx, sim: Sim, advances: AdvanceReq[], withPeak = true): number {
+  let s = sim.overdraftFees + advances.length * ctx.state.advance.fee + (withPeak ? sim.peakOverdraft * 0.05 : 0)
   for (const ob of sim.obligations) {
-    if (ob.autopay || !missed(ob)) continue
-    if (ob.isPastDueCatchUp) s += BUREAU_PENALTY
-    else s += ob.lateFee > 0 ? ob.lateFee : LATE_PENALTY
+    if (ob.autopay) continue
+    if (ob.isPastDueCatchUp) {
+      s += bureauCost(ctx, ob)
+    } else if (missed(ob)) {
+      s += ob.lateFee > 0 ? ob.lateFee : LATE_PENALTY
+    }
   }
   return s
 }
@@ -478,21 +566,19 @@ function repayDateFor(ctx: Ctx, a: AdvanceReq): string | null {
   return ctx.paychecks.find((p) => p.date > a.requestDate)?.date ?? null
 }
 
-/** Advance principal outstanding on `on`, from advances requested earlier (`before`) and those the user recorded */
+/**
+ * Advance principal already taken in the same pay period as `on`: advances
+ * requested earlier (`before`) plus the ones the user recorded, matched to a
+ * period by their date. Each period has its own limit, so advances taken in an
+ * earlier period don't count even if they haven't been repaid yet.
+ */
 function outstandingOn(ctx: Ctx, before: AdvanceReq[], on: string): number {
-  const first = ctx.paychecks[0]?.date
-  const recorded =
-    first === undefined || on < first
-      ? ctx.state.income.advances.reduce((s, a) => s + a.amount, 0)
-      : 0
+  const period = periodOf(ctx.paychecks, on) ?? ctx.paychecks.find((p) => p.date > on)
+  if (!period) return 0
+  const inPeriod = (date: string) => periodOf(ctx.paychecks, date)?.date === period.date
   return (
-    recorded +
-    before
-      .filter((b) => {
-        const repay = repayDateFor(ctx, b)
-        return repay === null || repay > on
-      })
-      .reduce((s, b) => s + b.amount, 0)
+    ctx.state.income.advances.filter((a) => inPeriod(a.date)).reduce((s, a) => s + a.amount, 0) +
+    before.filter((b) => inPeriod(b.requestDate)).reduce((s, b) => s + b.amount, 0)
   )
 }
 
@@ -506,72 +592,122 @@ function availableOn(ctx: Ctx, before: AdvanceReq[], on: string): number {
   )
 }
 
-/** Does every advance stay within what the employer would allow on its request date? */
-function advancesValid(ctx: Ctx, advances: AdvanceReq[]): boolean {
-  const order = advances
+/**
+ * Fit a set of advances to the employer's limits: in date order, shrink each to what
+ * its pay period still allows on that day (dropping ones that no longer fit). Adding
+ * an early advance can use up room a later one in the same period had counted on.
+ */
+function repairAdvances(ctx: Ctx, advances: AdvanceReq[]): AdvanceReq[] {
+  const ordered = advances
     .map((a, i) => ({ a, i }))
     .sort((x, y) => x.a.requestDate.localeCompare(y.a.requestDate) || x.i - y.i)
-  for (let k = 0; k < order.length; k++) {
-    const { a } = order[k]
-    if (a.requestDate < ctx.today) return false
-    const earlier = order.slice(0, k).map((o) => o.a)
-    if (a.amount > availableOn(ctx, earlier, a.requestDate) + 1e-9) return false
+  const kept: AdvanceReq[] = []
+  for (const { a } of ordered) {
+    if (a.requestDate < ctx.today) continue
+    const room = Math.floor(availableOn(ctx, kept, a.requestDate))
+    const amount = Math.min(a.amount, room)
+    if (amount >= 1) kept.push({ ...a, amount })
   }
-  return true
+  return kept
 }
 
 /**
- * Try to fix the most urgent payment that a pay advance could rescue. Returns
- * the improved advances + simulation, or null when nothing helps.
+ * One round of the advance search: from the most urgent payments an advance could
+ * rescue, generate candidate advances, re-simulate each, and return the single
+ * best move — or null when nothing makes the plan better. Payments about to be
+ * reported come first; overdraft-fee tweaks are only considered when no account
+ * is heading for a report, and taking the *best* move (not the first) keeps a
+ * small fee saving from using up the limit an account needs.
  */
 function improveWithAdvance(
   ctx: Ctx,
   advances: AdvanceReq[],
   sim: Sim,
-  skipped: Set<string>,
 ): { advances: AdvanceReq[]; sim: Sim } | null {
   const lead = ctx.state.advance.leadDays
   const base = score(ctx, sim, advances)
 
-  const candidates = sim.obligations
+  const all = sim.obligations
     .map((ob, i) => ({ ob, i }))
-    .filter(({ ob }) => needsAdvance(ob, sim) && !skipped.has(obligationKey(ob)))
-    // Payments headed for a bureau report get first call on the advance limit
+    .filter(({ ob }) => needsAdvance(ob, sim))
     .sort(
       (a, b) =>
         Number(b.ob.bureauCritical) - Number(a.ob.bureauCritical) ||
         (a.ob.deadline ?? '').localeCompare(b.ob.deadline ?? '') ||
         a.i - b.i,
     )
+  const missedFirst = all.filter(({ ob }) => missed(ob))
+  const candidates = (missedFirst.length > 0 ? missedFirst : all).slice(0, MAX_CANDIDATES)
 
+  let best: { advances: AdvanceReq[]; sim: Sim; score: number } | null = null
   for (const { ob } of candidates) {
     const deadline = ob.deadline as string
     const need = Math.ceil(ob.shortBy ?? 0)
-    const request = addDays(deadline, -lead)
+    if (need <= 0 || addDays(deadline, -lead) < ctx.today) continue
+    // A payment about to be reported can wait until the day before it is: a later
+    // day may have room the deadline day doesn't (a new pay period's limit).
+    const lastDay = ob.bureauCritical && ob.reportDate ? addDays(ob.reportDate, -1) : deadline
     const options: AdvanceReq[][] = []
 
-    if (request >= ctx.today && need > 0) {
-      // Top up an advance that's already out and still unpaid on this deadline:
-      // one fee instead of two.
-      advances.forEach((a, idx) => {
-        const repay = repayDateFor(ctx, a)
-        const arrives = addDays(a.requestDate, lead)
-        if (arrives <= deadline && (repay === null || repay > deadline)) {
+    // Two sizes: everything missing (clears any overdraft too), or the least that lets
+    // the overdraft room cover the rest — which leaves more of the limit for others.
+    const sizes = [...new Set([Math.ceil(ob.shortMin ?? need), need].filter((n) => n >= 1))]
+
+    // Top up an advance that's already out and still unpaid on this deadline:
+    // one fee instead of two.
+    advances.forEach((a, idx) => {
+      const repay = repayDateFor(ctx, a)
+      const arrives = addDays(a.requestDate, lead)
+      if (arrives <= deadline && (repay === null || repay > deadline)) {
+        for (const size of sizes) {
           const next = advances.map((x, j) =>
-            j === idx ? { ...x, amount: x.amount + need, forDebts: [...x.forDebts, ob.debtName] } : x,
+            j === idx ? { ...x, amount: x.amount + size, forDebts: [...x.forDebts, ob.debtName] } : x,
           )
-          if (advancesValid(ctx, next)) options.push(next)
+          options.push(repairAdvances(ctx, next))
         }
-      })
-      // A new advance, trimmed to what's available that day
-      const amount = Math.min(need, Math.floor(availableOn(ctx, advances, request)))
-      if (amount >= 1) {
+      }
+    })
+    // A new advance, trimmed to what's available on the day it's requested. Only advances
+    // requested by then count against that day (a later one doesn't block an earlier one;
+    // repairAdvances shrinks the later ones to fit).
+    for (let arrive = deadline; arrive <= lastDay; arrive = addDays(arrive, 1)) {
+      const request = addDays(arrive, -lead)
+      if (request < ctx.today) continue
+      const room = Math.floor(
+        availableOn(ctx, advances.filter((a) => a.requestDate <= request), request),
+      )
+      for (const amount of new Set(sizes.map((size) => Math.min(size, room)))) {
+        if (amount < 1) continue
         const next = [...advances, { requestDate: request, amount, forDebts: [ob.debtName] }]
-        if (advancesValid(ctx, next)) options.push(next)
+        options.push(repairAdvances(ctx, next))
       }
     }
+    // One advance often isn't enough (each pay period only offers so much), so also try
+    // taking what each pay period can give, on the latest day of each.
+    for (const target of sizes) {
+      const combined: AdvanceReq[] = []
+      let remaining = target
+      for (const p of ctx.paychecks) {
+        const latest = addDays(lastDay, -lead)
+        const request = latest < p.periodEnd ? latest : p.periodEnd
+        if (request < ctx.today || request < p.periodStart) continue
+        const room = Math.floor(
+          availableOn(
+            ctx,
+            [...advances, ...combined].filter((a) => a.requestDate <= request),
+            request,
+          ),
+        )
+        const amount = Math.min(remaining, room)
+        if (amount >= 1) {
+          combined.push({ requestDate: request, amount, forDebts: [ob.debtName] })
+          remaining -= amount
+        }
+        if (remaining <= 0) break
+      }
+      if (combined.length > 1) options.push(repairAdvances(ctx, [...advances, ...combined]))
+    }
 
-    let best: { advances: AdvanceReq[]; sim: Sim; score: number } | null = null
     for (const next of options) {
       const nextSim = simulate(ctx, next)
       const nextScore = score(ctx, nextSim, next)
@@ -579,10 +715,139 @@ function improveWithAdvance(
         best = { advances: next, sim: nextSim, score: nextScore }
       }
     }
-    if (best) return best
-    skipped.add(obligationKey(ob))
   }
-  return null
+  return best
+}
+
+/**
+ * Take the most each pay period allows on each of the given days (in date order).
+ * `for` records which payment a day was added for.
+ */
+function fillAdvances(ctx: Ctx, days: Map<string, string[]>): AdvanceReq[] {
+  const out: AdvanceReq[] = []
+  for (const day of [...days.keys()].sort()) {
+    if (day < ctx.today) continue
+    const amount = Math.floor(availableOn(ctx, out, day))
+    if (amount >= 1) out.push({ requestDate: day, amount, forDebts: days.get(day) ?? [] })
+  }
+  return out
+}
+
+/**
+ * Second search, the mirror of the first: start from taking the most on every day a
+ * payment is short, then drop days one at a time while the plan doesn't get worse.
+ * Advances often only pay off as a chain — each one funds the paycheck the previous
+ * one shrank — so any *partial* chain can look worse than none, and adding one at a
+ * time never finds it. Removing from the full chain does.
+ */
+function backwardAdvances(
+  ctx: Ctx,
+  sim: Sim,
+  seed: AdvanceReq[] = [],
+): { advances: AdvanceReq[]; sim: Sim } | null {
+  const lead = ctx.state.advance.leadDays
+  // every day a payment headed for the bureaus (or otherwise short) could use an advance:
+  // from its deadline to the last day it can wait
+  const needy = sim.obligations
+    .filter((ob) => needsAdvance(ob, sim) || (ob.bureauCritical && !ob.autopay && ob.deadline !== null))
+    .sort(
+      (a, b) =>
+        Number(b.bureauCritical) - Number(a.bureauCritical) ||
+        (a.deadline ?? '').localeCompare(b.deadline ?? ''),
+    )
+    .slice(0, MAX_BACKWARD_PAYMENTS)
+  const days = new Map<string, string[]>()
+  for (const a of seed) days.set(a.requestDate, [...a.forDebts])
+  for (const ob of needy) {
+    const deadline = ob.deadline as string
+    const lastDay = ob.bureauCritical && ob.reportDate ? addDays(ob.reportDate, -1) : deadline
+    for (let arrive = deadline; arrive <= lastDay; arrive = addDays(arrive, 1)) {
+      const request = addDays(arrive, -lead)
+      if (request >= ctx.today) days.set(request, [...(days.get(request) ?? []), ob.debtName])
+    }
+  }
+  if (days.size === 0) return null
+
+  const evaluate = (set: Map<string, string[]>) => {
+    const advances = fillAdvances(ctx, set)
+    const s = simulate(ctx, advances)
+    return { advances, sim: s, score: score(ctx, s, advances) }
+  }
+  let current = evaluate(days)
+  const remaining = new Map(days)
+  // one pass tries dropping each day; keep dropping while a pass removes something
+  let removed = true
+  while (removed && remaining.size > 1) {
+    removed = false
+    for (const day of [...remaining.keys()].sort()) {
+      if (remaining.size <= 1) break
+      const without = new Map(remaining)
+      without.delete(day)
+      const trial = evaluate(without)
+      if (trial.score <= current.score + 1e-6) {
+        current = trial
+        remaining.delete(day)
+        removed = true
+      }
+    }
+  }
+  return { advances: current.advances, sim: current.sim }
+}
+
+/**
+ * The searches take whatever an advance allows; borrow only what's needed. For each
+ * advance, find the smallest amount that leaves the plan just as good (same fees,
+ * same payments on time) — no reason to shrink next paycheck by more than that.
+ */
+function shrinkAdvances(
+  ctx: Ctx,
+  advances: AdvanceReq[],
+  sim: Sim,
+): { advances: AdvanceReq[]; sim: Sim } {
+  let current = { advances, sim }
+  const target = score(ctx, sim, advances, false)
+  for (let i = 0; i < current.advances.length; i++) {
+    let lo = 1
+    let hi = current.advances[i].amount
+    let best = { advances: current.advances, sim: current.sim }
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2)
+      const trial = current.advances.map((a, j) => (j === i ? { ...a, amount: mid } : a))
+      const trialSim = simulate(ctx, trial)
+      if (score(ctx, trialSim, trial, false) <= target + 1e-6) {
+        best = { advances: trial, sim: trialSim }
+        hi = mid
+      } else {
+        lo = mid + 1
+      }
+    }
+    current = best
+  }
+  return current
+}
+
+/** Drop any advance the plan does better without (an earlier move can make a later one pointless). */
+function pruneAdvances(
+  ctx: Ctx,
+  advances: AdvanceReq[],
+  sim: Sim,
+): { advances: AdvanceReq[]; sim: Sim } {
+  let current = { advances, sim }
+  let improved = true
+  while (improved && current.advances.length > 0) {
+    improved = false
+    const base = score(ctx, current.sim, current.advances)
+    for (let i = current.advances.length - 1; i >= 0; i--) {
+      const without = current.advances.filter((_, j) => j !== i)
+      const withoutSim = simulate(ctx, without)
+      if (score(ctx, withoutSim, without) <= base - 1e-6) {
+        current = { advances: without, sim: withoutSim }
+        improved = true
+        break
+      }
+    }
+  }
+  return current
 }
 
 // ---------------------------------------------------------------------------
