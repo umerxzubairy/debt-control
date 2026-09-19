@@ -70,6 +70,24 @@ export default function IncomePanel({
             />
           </label>
           <label>
+            Pay past-due accounts this many days before they're reported
+            <input
+              type="number"
+              min="0"
+              max="10"
+              value={settings.bureauSafetyDays ?? 2}
+              onChange={(e) =>
+                dispatch({
+                  type: 'setSettings',
+                  settings: {
+                    ...settings,
+                    bureauSafetyDays: Math.min(10, Math.max(0, parseInt(e.target.value) || 0)),
+                  },
+                })
+              }
+            />
+          </label>
+          <label>
             Max overdraft allowed ($) — 0 = never go negative
             <input
               type="number"

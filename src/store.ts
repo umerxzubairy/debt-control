@@ -38,6 +38,7 @@ export const initialState: AppState = {
     asOfDate: todayISO(),
     strategy: 'avalanche',
     bureauReportDays: 30,
+    bureauSafetyDays: 2,
     overdraftLimit: 0,
     overdraftFee: 0,
   },

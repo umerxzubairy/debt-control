@@ -16,12 +16,6 @@ import { advanceAvailable, buildPaychecks, periodOf, type Paycheck } from './pay
 export const HORIZON_DAYS = 84
 
 /**
- * Overdraft-funded catch-ups are paid this many days before the creditor's
- * bureau-reporting date, since card payments can take a couple of days to post.
- */
-export const BUREAU_SAFETY_DAYS = 2
-
-/**
  * What a late payment is assumed to cost when the debt has no late fee set —
  * used only to decide whether a pay-advance fee is worth paying to be on time.
  */
@@ -65,6 +59,8 @@ interface Obligation {
   reportsToBureau: boolean
   /** Deducted on dueDate no matter what; never rescheduled */
   autopay: boolean
+  /** Paid only from real cash, after everything else; never worth borrowing for */
+  canWait: boolean
   // filled during simulation
   plannedDate: string | null
   balanceAfter?: number
@@ -202,6 +198,9 @@ export function buildPlan(state: AppState): PlanResult {
       ;({ advances, sim } = pruneAdvances(ctx, advances, sim))
       ;({ advances, sim } = shrinkAdvances(ctx, advances, sim))
     }
+    const before = advances.length
+    ;({ advances, sim } = consolidateAdvances(ctx, advances, sim))
+    if (advances.length < before) ({ advances, sim } = shrinkAdvances(ctx, advances, sim))
 
     // Advances requested the same day arrive together and come out of the same
     // check, so they only need one transfer — and one fee.
@@ -238,7 +237,13 @@ function mergeSameDay(advances: AdvanceReq[]): AdvanceReq[] {
 
 function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
   const { state, today, horizonEnd, overdraftLimit, overdraftFee } = ctx
-  const obligations = buildObligations(state.debts, state.settings.bureauReportDays, today, horizonEnd)
+  const obligations = buildObligations(
+    state.debts,
+    state.settings.bureauReportDays,
+    state.settings.bureauSafetyDays ?? 2,
+    today,
+    horizonEnd,
+  )
 
   // --- priority order ---
   obligations.sort((a, b) => {
@@ -248,6 +253,7 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
       if (a.reportsToBureau !== b.reportsToBureau) return a.reportsToBureau ? -1 : 1
       return (a.daysUntilReport ?? 999) - (b.daysUntilReport ?? 999)
     }
+    if (a.canWait !== b.canWait) return a.canWait ? 1 : -1
     return a.dueDate.localeCompare(b.dueDate)
   })
 
@@ -547,7 +553,7 @@ function score(ctx: Ctx, sim: Sim, advances: AdvanceReq[], withPeak = true): num
     if (ob.autopay) continue
     if (ob.isPastDueCatchUp) {
       s += bureauCost(ctx, ob)
-    } else if (missed(ob)) {
+    } else if (missed(ob) && !ob.canWait) {
       s += ob.lateFee > 0 ? ob.lateFee : LATE_PENALTY
     }
   }
@@ -826,6 +832,54 @@ function shrinkAdvances(
   return current
 }
 
+/**
+ * Advances that come out of the same paycheck don't each need their own transfer (and
+ * $3 fee): where one advance can take on another's amount and the plan is no worse,
+ * merge them. The searches add advances a day at a time as needs come up, so this is
+ * what turns "Sep 23 + Sep 24" into a single Sep 24 advance.
+ */
+function consolidateAdvances(
+  ctx: Ctx,
+  advances: AdvanceReq[],
+  sim: Sim,
+): { advances: AdvanceReq[]; sim: Sim } {
+  if (ctx.state.advance.fee <= 0) return { advances, sim } // nothing to save
+  let current = { advances, sim }
+  let merged = true
+  while (merged && current.advances.length > 1) {
+    merged = false
+    const list = current.advances
+    const base = score(ctx, current.sim, list, false)
+    search: for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        if (repayDateFor(ctx, list[i]) !== repayDateFor(ctx, list[j])) continue
+        // fold the earlier into the later first (money later, more accrued room), then the other way
+        for (const [keep, drop] of [
+          [j, i],
+          [i, j],
+        ]) {
+          const next = list
+            .filter((_, k) => k !== drop)
+            .map((a) =>
+              a === list[keep]
+                ? { ...a, amount: a.amount + list[drop].amount, forDebts: [...a.forDebts, ...list[drop].forDebts] }
+                : a,
+            )
+          const fitted = repairAdvances(ctx, next)
+          if (fitted.length !== next.length) continue // the merged amount doesn't fit the limit
+          const trialSim = simulate(ctx, fitted)
+          if (score(ctx, trialSim, fitted, false) < base - 1e-6) {
+            current = { advances: fitted, sim: trialSim }
+            merged = true
+            break search
+          }
+        }
+      }
+    }
+  }
+  return current
+}
+
 /** Drop any advance the plan does better without (an earlier move can make a later one pointless). */
 function pruneAdvances(
   ctx: Ctx,
@@ -859,6 +913,28 @@ function toResult(ctx: Ctx, sim: Sim, advances: AdvanceReq[]): PlanResult {
   const { obligations, paydays, cash, overdraftFees, feeEvents, peakOverdraft } = sim
   const adv = state.advance
 
+  // Label each advance with the payments that would be paid later (or not at all) without
+  // it — what it really pays for, rather than which search step happened to add it.
+  const keyOf = (o: Obligation) => `${o.debtId}|${o.dueDate}|${o.isPastDueCatchUp}`
+  const plannedOn = new Map(obligations.map((o) => [keyOf(o), o.plannedDate ?? '9999-12-31']))
+  const labelFor = (a: AdvanceReq): string[] => {
+    // Only payments made while the advance is outstanding (arrival until the paycheck that
+    // repays it): later ones change only because the repayment shrinks that paycheck.
+    const from = addDays(a.requestDate, adv.leadDays)
+    const to = repayDateFor(ctx, a) ?? '9999-12-31'
+    const without = simulate(ctx, advances.filter((x) => x !== a))
+    return [
+      ...new Set(
+        without.obligations
+          .filter((o) => {
+            const paid = plannedOn.get(keyOf(o)) ?? ''
+            return !o.autopay && paid >= from && paid < to && (o.plannedDate ?? '9999-12-31') > paid
+          })
+          .map((o) => o.debtName),
+      ),
+    ]
+  }
+
   const plannedAdvances: PlannedAdvance[] = advances
     .map((a) => ({
       requestDate: a.requestDate,
@@ -866,7 +942,7 @@ function toResult(ctx: Ctx, sim: Sim, advances: AdvanceReq[]): PlanResult {
       amount: a.amount,
       fee: adv.fee,
       repayDate: repayDateFor(ctx, a),
-      forDebts: [...new Set(a.forDebts)],
+      forDebts: labelFor(a),
     }))
     .sort((a, b) => a.requestDate.localeCompare(b.requestDate))
 
@@ -949,6 +1025,7 @@ function lateFeeFor(ob: Obligation): number {
 function buildObligations(
   debts: Debt[],
   bureauReportDays: number,
+  safetyDays: number,
   today: string,
   horizonEnd: string,
 ): Obligation[] {
@@ -967,9 +1044,9 @@ function buildObligations(
         amount: Math.min(amount, debt.balance),
         dueDate: since,
         payableFrom: today,
-        // pay a couple of days before the report date so the payment posts in time
+        // pay `safetyDays` before the report date so the payment posts in time
         deadline: debt.reportsToBureau
-          ? maxDate(today, addDays(since, bureauReportDays - 1 - BUREAU_SAFETY_DAYS))
+          ? maxDate(today, addDays(since, bureauReportDays - 1 - safetyDays))
           : null,
         bureauCritical: debt.reportsToBureau,
         reportDate: debt.reportsToBureau ? addDays(since, bureauReportDays) : null,
@@ -981,6 +1058,7 @@ function buildObligations(
         reportsToBureau: debt.reportsToBureau,
         // a catch-up is a manual payment even on an autopay debt
         autopay: false,
+        canWait: false,
         plannedDate: null,
       })
     }
@@ -1000,13 +1078,15 @@ function buildObligations(
         dueDate: due,
         // don't tie up cash more than 7 days before the due date
         payableFrom: maxDate(today, addDays(due, -7)),
-        deadline: due,
+        // a bill that can wait has no deadline to borrow for: it's paid from real cash only
+        deadline: debt.canWait ? null : due,
         bureauCritical: false,
         reportDate: null,
         lateFee: debt.lateFee ?? 0,
         isPastDueCatchUp: false,
         reportsToBureau: debt.reportsToBureau,
         autopay: debt.autopay === true,
+        canWait: debt.canWait === true,
         plannedDate: null,
       })
       remaining -= amount

@@ -44,6 +44,12 @@ export interface Debt {
    * balance is short (overdraft). Missing/false = manual payment.
    */
   autopay?: boolean
+  /**
+   * Can be paid late without borrowing: the plan pays it only from money actually in
+   * the account, after everything that could be reported, and never uses overdraft or
+   * a pay advance to make it on time. Applies to regular payments, not past-due catch-ups.
+   */
+  canWait?: boolean
   /** Fee the lender charges when a payment lands after its due date (0/missing = none) */
   lateFee?: number
   notes?: string
@@ -105,6 +111,11 @@ export interface Settings {
   strategy: Strategy
   /** Days past due at which a creditor typically reports to bureaus */
   bureauReportDays: number
+  /**
+   * Pay a past-due account this many days before its report date, since payments can take
+   * a day or two to post (0 = the day before it's reported is fine).
+   */
+  bureauSafetyDays: number
   /** How far below $0 the bank lets the account go (0 = never plan to overdraw) */
   overdraftLimit: number
   /** Fee charged once per overdraft episode if the balance is still negative the next night */

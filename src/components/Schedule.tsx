@@ -168,7 +168,7 @@ export default function Schedule({ plan }: { state: AppState; plan: PlanResult }
                   ⚡ PayActiv advance
                   <span className="muted">
                     {' '}
-                    · for {r.forDebts.join(', ')}
+                    · {r.forDebts.length > 0 ? `for ${r.forDebts.join(', ')}` : 'keeps you inside your overdraft limit'}
                     {r.requestDate !== r.date && ` · request on ${fmtDateShort(r.requestDate)}`}
                     {' · '}
                     {fmtMoney(r.amount + r.fee)} ({r.fee > 0 ? `${fmtMoney(r.fee)} fee` : 'no fee'})
