@@ -29,6 +29,10 @@ export default function App() {
   const totalDebt = state.debts.reduce((s, d) => s + d.balance, 0)
   const nextPayday = plan.paydays[0]
 
+  // accounts the plan lets slip to a bureau report (a past-due one, or a payment that goes 30 days late)
+  const reportedNames = [...new Set(plan.payments.filter((p) => p.missesBureau).map((p) => p.debtName))]
+  const hasReportingDebts = state.debts.some((d) => d.reportsToBureau && d.balance > 0)
+
   // how much further below $0 the bank will still let the account go right now
   const overdraftLimit = state.settings.overdraftLimit ?? 0
   const overdraftRoom = Math.max(0, overdraftLimit + Math.min(0, state.settings.bankBalance))
@@ -93,6 +97,19 @@ export default function App() {
               ]
                 .filter(Boolean)
                 .join(' · ')}
+            />
+          )}
+          {hasReportingDebts && (
+            <Stat
+              label="Reported to bureaus (12 wks)"
+              value={String(reportedNames.length)}
+              tone={reportedNames.length > 0 ? 'bad' : 'good'}
+              sub={
+                reportedNames.length === 0
+                  ? 'every payment beats its report date'
+                  : reportedNames.slice(0, 3).join(', ') +
+                    (reportedNames.length > 3 ? ` +${reportedNames.length - 3} more` : '')
+              }
             />
           )}
           {plan.shortfall > 0 ? (

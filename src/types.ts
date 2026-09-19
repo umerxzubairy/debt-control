@@ -44,12 +44,6 @@ export interface Debt {
    * balance is short (overdraft). Missing/false = manual payment.
    */
   autopay?: boolean
-  /**
-   * Can be paid late without borrowing: the plan pays it only from money actually in
-   * the account, after everything that could be reported, and never uses overdraft or
-   * a pay advance to make it on time. Applies to regular payments, not past-due catch-ups.
-   */
-  canWait?: boolean
   /** Fee the lender charges when a payment lands after its due date (0/missing = none) */
   lateFee?: number
   notes?: string

@@ -49,18 +49,24 @@ interface Obligation {
    */
   deadline: string | null
   isPastDueCatchUp: boolean
-  /** Past-due on a bureau-reporting debt: worth an overdraft fee to avoid a report */
+  /**
+   * On a bureau-reporting debt: the payment is heading for a report if it isn't paid in
+   * time — a past-due catch-up, or a regular payment that slips 30 days late. Worth
+   * borrowing for as its report date nears.
+   */
   bureauCritical: boolean
-  /** The day the creditor reports this past-due account to the bureaus */
+  /** The day the creditor would report this payment as 30 days late (due/missed date + report days) */
   reportDate: string | null
+  /** Last safe day to pay it before that report (report date - 1 - safety margin), never before today */
+  hardDeadline: string | null
+  /** Its report date is past the end of the plan, so being unpaid at the end isn't a report yet */
+  beyondHorizon: boolean
   /** Fee the lender charges if this lands after dueDate */
   lateFee: number
   daysUntilReport?: number
   reportsToBureau: boolean
   /** Deducted on dueDate no matter what; never rescheduled */
   autopay: boolean
-  /** Paid only from real cash, after everything else; never worth borrowing for */
-  canWait: boolean
   // filled during simulation
   plannedDate: string | null
   balanceAfter?: number
@@ -68,6 +74,9 @@ interface Obligation {
   shortBy?: number
   /** The least an advance would have to add for the overdraft room to cover the rest */
   shortMin?: number
+  /** The same two numbers, measured when it was already heading for a report (the last safe stretch) */
+  shortByHard?: number
+  shortMinHard?: number
   /** For a catch-up that can't be saved: extra money it would take, if nothing else were paid */
   bureauGap?: number
 }
@@ -80,6 +89,10 @@ interface AdvanceReq {
 }
 
 interface Ctx {
+  /** Finished simulations by the set of advances they were run with (results are never modified) */
+  simCache: Map<string, Sim>
+  /** Every payment in the plan, in priority order, built once; each simulation works on copies */
+  template: Obligation[]
   state: AppState
   today: string
   horizonEnd: string
@@ -141,6 +154,8 @@ export function buildPlan(state: AppState): PlanResult {
     .sort((a, b) => a.date.localeCompare(b.date))
 
   const ctx: Ctx = {
+    simCache: new Map(),
+    template: sortedObligations(state, today, horizonEnd),
     state,
     today,
     horizonEnd,
@@ -231,12 +246,12 @@ function mergeSameDay(advances: AdvanceReq[]): AdvanceReq[] {
   return [...byDay.values()]
 }
 
-// ---------------------------------------------------------------------------
-// Cash simulation
-// ---------------------------------------------------------------------------
-
-function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
-  const { state, today, horizonEnd, overdraftLimit, overdraftFee } = ctx
+/**
+ * Every payment in the plan, in the order money should go to them: 1) anything that can be
+ * reported to the bureaus, by the date it would be reported; 2) other past-due accounts;
+ * 3) everything else by due date.
+ */
+function sortedObligations(state: AppState, today: string, horizonEnd: string): Obligation[] {
   const obligations = buildObligations(
     state.debts,
     state.settings.bureauReportDays,
@@ -244,18 +259,37 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
     today,
     horizonEnd,
   )
-
-  // --- priority order ---
-  obligations.sort((a, b) => {
-    if (a.isPastDueCatchUp !== b.isPastDueCatchUp) return a.isPastDueCatchUp ? -1 : 1
-    if (a.isPastDueCatchUp && b.isPastDueCatchUp) {
-      // reporting debts before non-reporting; closest to reporting first
-      if (a.reportsToBureau !== b.reportsToBureau) return a.reportsToBureau ? -1 : 1
-      return (a.daysUntilReport ?? 999) - (b.daysUntilReport ?? 999)
+  const tier = (o: Obligation) => (o.reportDate !== null ? 0 : o.isPastDueCatchUp ? 1 : 2)
+  return obligations.sort((a, b) => {
+    if (tier(a) !== tier(b)) return tier(a) - tier(b)
+    if (tier(a) === 0 && a.reportDate !== b.reportDate) {
+      return (a.reportDate as string).localeCompare(b.reportDate as string)
     }
-    if (a.canWait !== b.canWait) return a.canWait ? 1 : -1
+    if (a.isPastDueCatchUp !== b.isPastDueCatchUp) return a.isPastDueCatchUp ? -1 : 1
     return a.dueDate.localeCompare(b.dueDate)
   })
+}
+
+// ---------------------------------------------------------------------------
+// Cash simulation
+// ---------------------------------------------------------------------------
+
+function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
+  // the searches keep re-trying the same sets of advances (labels don't affect the result)
+  const key = advances
+    .map((a) => `${a.requestDate}:${a.amount}`)
+    .sort()
+    .join(',')
+  const cached = ctx.simCache.get(key)
+  if (cached) return cached
+  const result = runSimulation(ctx, advances)
+  ctx.simCache.set(key, result)
+  return result
+}
+
+function runSimulation(ctx: Ctx, advances: AdvanceReq[]): Sim {
+  const { state, today, horizonEnd, overdraftLimit, overdraftFee } = ctx
+  const obligations = ctx.template.map((o) => ({ ...o }))
 
   const paydays = buildPaydays(ctx, advances)
   const paydayByDate = new Map(paydays.map((p) => [p.date, p.net]))
@@ -308,10 +342,13 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
     return cashNow + forcedDelta(addDays(from, 1)) < 0
   }
 
+  // the day's payment order only changes when something is paid or a catch-up stops being savable
+  let orderDirty = true
   const fund = (ob: Obligation, d: string) => {
     ob.plannedDate = d
     cash -= ob.amount
     ob.balanceAfter = round2(cash)
+    orderDirty = true
   }
 
   // --- protecting payments that must beat a bureau report ---
@@ -331,7 +368,7 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
   const criticalOrder = obligations
     .filter((o) => o.bureauCritical && !o.autopay)
     .map((o, i) => ({ o, i }))
-    .sort((a, b) => (a.o.deadline ?? '').localeCompare(b.o.deadline ?? '') || a.i - b.i)
+    .sort((a, b) => (a.o.hardDeadline ?? '').localeCompare(b.o.hardDeadline ?? '') || a.i - b.i)
     .map((x) => x.o)
 
   // For each catch-up, from each day on: the most forced money (paydays etc.) that
@@ -356,20 +393,45 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
   const lead = state.advance.leadDays
   const advPotential = new Map<Obligation, number[]>()
   if (state.advance.enabled) {
+    // many payments share the same period ends, so what's available on a day is worked out once
+    const availableByDay = new Map<string, number>()
+    const availableFloor = (d: string) => {
+      let v = availableByDay.get(d)
+      if (v === undefined) {
+        v = Math.floor(availableOn(ctx, advances, d))
+        availableByDay.set(d, v)
+      }
+      return v
+    }
+    const lastPeriodEnd = ctx.paychecks[ctx.paychecks.length - 1]?.periodEnd ?? ''
+    const potentialByLatest = new Map<string, number[]>()
     for (const y of criticalOrder) {
       const lastDay = y.reportDate ? addDays(y.reportDate, -1) : horizonEnd
+      const latest = addDays(lastDay, -lead)
+      // past the last known pay period every payment sees the same thing
+      const shareKey = latest > lastPeriodEnd ? 'end' : latest
+      const shared = potentialByLatest.get(shareKey)
+      if (shared) {
+        advPotential.set(y, shared)
+        continue
+      }
       const parts: { d: string; amount: number }[] = []
       for (const p of ctx.paychecks) {
-        const latest = addDays(lastDay, -lead)
         const d = latest < p.periodEnd ? latest : p.periodEnd
         if (d < today || d < p.periodStart) continue
-        const amount = Math.floor(availableOn(ctx, advances, d))
+        const amount = availableFloor(d)
         if (amount >= 1) parts.push({ d, amount })
       }
-      advPotential.set(
-        y,
-        days.map((day) => parts.filter((part) => part.d >= day).reduce((s, part) => s + part.amount, 0)),
-      )
+      // potential[i] = what the periods whose last useful day is on/after day i can still give
+      parts.sort((a, b) => a.d.localeCompare(b.d))
+      let remaining = parts.reduce((sum, part) => sum + part.amount, 0)
+      let next = 0
+      const potential = days.map((day) => {
+        while (next < parts.length && parts[next].d < day) remaining -= parts[next++].amount
+        return remaining
+      })
+      potentialByLatest.set(shareKey, potential)
+      advPotential.set(y, potential)
     }
   }
 
@@ -386,6 +448,11 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
    * heads for the bureaus. Accounts that can't be saved (or are already
    * reported) don't hold anything back.
    */
+  // room = balance + inflows (+ advances still possible) + overdraft. Using overdraft may
+  // cost a fee — unless this overdraft episode has already been charged.
+  const roomOf = (balance: number, flows: number, need: number) =>
+    balance + flows + overdraftLimit - (balance + flows < need && negDays < 2 ? overdraftFee : 0)
+
   const roomForBureau = (x: Obligation, from: string): boolean => {
     const fromI = dayIndex.get(from) ?? 0
     const xSavable = savableOn(x, fromI) // if x is itself heading for a report, only more urgent ones matter
@@ -398,21 +465,26 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
       const best = bestAhead.get(y)?.[fromI] ?? -Infinity
       if (y.plannedDate || best === -Infinity) continue
       const flows = best - cumFlow[fromI] + (advPotential.get(y)?.[fromI] ?? 0)
-      // room = balance + inflows (+ advances still possible) + overdraft. Using overdraft
-      // may cost a fee — unless this overdraft episode has already been charged.
-      const room = (balance: number, need: number) =>
-        balance + flows + overdraftLimit - (balance + flows < need && negDays < 2 ? overdraftFee : 0)
       const need = committed + y.amount
-      if (need > room(cash, need)) {
+      const roomNow = roomOf(cash, flows, need)
+      if (need > roomNow) {
         // can't be paid anyway: remember how far short it is, assuming nothing else is paid
-        y.bureauGap ??= Math.ceil(need - room(cash, need))
+        y.bureauGap ??= Math.ceil(need - roomNow)
         continue
       }
       committed = need
-      if (room(cash - x.amount, committed) < committed) return false
+      if (roomOf(cash - x.amount, flows, committed) < committed) return false
     }
     return true
   }
+
+  // days on which a catch-up stops being savable just by time passing
+  const flipDays = new Set<number>()
+  for (const y of criticalOrder) {
+    const best = bestAhead.get(y) as number[]
+    for (let i = 1; i < best.length; i++) if (best[i] === -Infinity && best[i - 1] !== -Infinity) flipDays.add(i)
+  }
+  let ordered: Obligation[] = obligations
 
   while (day <= horizonEnd) {
     cash += paydayByDate.get(day) ?? 0
@@ -425,11 +497,14 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
     // Catch-ups that can still be saved from the bureaus go first; one that has
     // already been reported no longer outranks them for the day's money.
     const dayI = dayIndex.get(day) ?? 0
-    const ordered = [...obligations].sort(
-      (a, b) =>
-        Number(!savableOn(a, dayI)) - Number(!savableOn(b, dayI)) ||
-        (priority.get(a) ?? 0) - (priority.get(b) ?? 0),
-    )
+    if (orderDirty || flipDays.has(dayI)) {
+      ordered = [...obligations].sort(
+        (a, b) =>
+          Number(!savableOn(a, dayI)) - Number(!savableOn(b, dayI)) ||
+          (priority.get(a) ?? 0) - (priority.get(b) ?? 0),
+      )
+      orderDirty = false
+    }
     for (const ob of ordered) {
       if (ob.autopay || ob.plannedDate) continue
       if (day < ob.payableFrom) continue
@@ -439,29 +514,42 @@ function simulate(ctx: Ctx, advances: AdvanceReq[]): Sim {
         continue
       }
       // Not paid from cash: either it can't cover it, or the cash is being held
-      // for a bureau-critical catch-up. Is this the last safe day to borrow for it?
-      const deadline = ob.deadline
-      if (deadline === null) continue
-      if (ob.bureauCritical ? day < deadline : day !== deadline) continue
+      // for a payment heading for the bureaus. Is this a day to borrow for it?
+      //  - its normal deadline: a regular payment on its due date; a past-due catch-up on
+      //    every day from its deadline on
+      //  - the last safe stretch before it would be reported (any payment on a reporting debt)
+      const soft = ob.deadline
+      const inReportWindow =
+        ob.hardDeadline !== null && ob.reportDate !== null && day >= ob.hardDeadline && day < ob.reportDate
+      const atSoft = soft !== null && (ob.isPastDueCatchUp ? day >= soft : day === soft)
+      if (!atSoft && !inReportWindow) continue
+      // "bureau mode": worth a fee to avoid a report
+      const bureauMode = (ob.isPastDueCatchUp && ob.bureauCritical) || inReportWindow
       // A payment about to be reported beats the autopay hold-back: if the cash is
       // there, use it (a later autopay may then overdraw, which the plan flags).
-      if (ob.bureauCritical && cash >= ob.amount && roomForBureau(ob, day)) {
+      if (bureauMode && cash >= ob.amount && roomForBureau(ob, day)) {
         fund(ob, day)
         continue
       }
+      // held-back cash means a pay advance would have to cover the whole payment
+      const missing = affordable ? ob.amount : ob.amount - (cash - reserve)
+      const missingMin = ob.amount - (cash - reserve + overdraftLimit)
       if (ob.shortBy === undefined) {
-        // held-back cash means a pay advance would have to cover the whole payment
-        ob.shortBy = affordable ? ob.amount : ob.amount - (cash - reserve)
-        ob.shortMin = ob.amount - (cash - reserve + overdraftLimit)
+        ob.shortBy = missing
+        ob.shortMin = missingMin
+      }
+      if (bureauMode && ob.shortByHard === undefined) {
+        ob.shortByHard = missing
+        ob.shortMinHard = missingMin
       }
       if (overdraftLimit <= 0) continue
       const after = cash - ob.amount
       const extraFee = feeExpected(day, after) && !feeExpected(day, cash) ? overdraftFee : 0
       // Same rule for overdraft room: honour the autopay hold-back unless that would
       // leave a payment headed for the bureaus unpaid.
-      const holdBack = ob.bureauCritical && after - reserve - extraFee < -overdraftLimit ? 0 : reserve
+      const holdBack = bureauMode && after - reserve - extraFee < -overdraftLimit ? 0 : reserve
       const withinLimit = after - holdBack - extraFee >= -overdraftLimit
-      const worthIt = ob.bureauCritical || extraFee === 0 || ob.lateFee > extraFee
+      const worthIt = bureauMode || extraFee === 0 || ob.lateFee > extraFee
       if (withinLimit && worthIt && roomForBureau(ob, day)) fund(ob, day)
     }
 
@@ -539,11 +627,11 @@ function missed(ob: Obligation): boolean {
  */
 function bureauCost(ctx: Ctx, ob: Obligation): number {
   if (!ob.reportDate) return 0
-  if (!ob.plannedDate || ob.plannedDate >= ob.reportDate) {
+  if (missesBureau(ob)) {
     const daysAway = Math.max(0, daysBetween(ctx.today, ob.reportDate))
     return BUREAU_PENALTY + Math.max(0, HORIZON_DAYS - daysAway) * 10
   }
-  return ob.deadline && ob.plannedDate > ob.deadline ? SAFETY_PENALTY : 0
+  return ob.plannedDate && ob.hardDeadline && ob.plannedDate > ob.hardDeadline ? SAFETY_PENALTY : 0
 }
 
 /** Lower is better. Fees are real dollars; a missed payment costs its late fee (or an assumed penalty). */
@@ -551,11 +639,11 @@ function score(ctx: Ctx, sim: Sim, advances: AdvanceReq[], withPeak = true): num
   let s = sim.overdraftFees + advances.length * ctx.state.advance.fee + (withPeak ? sim.peakOverdraft * 0.05 : 0)
   for (const ob of sim.obligations) {
     if (ob.autopay) continue
-    if (ob.isPastDueCatchUp) {
-      s += bureauCost(ctx, ob)
-    } else if (missed(ob) && !ob.canWait) {
-      s += ob.lateFee > 0 ? ob.lateFee : LATE_PENALTY
-    }
+    // a report, for anything on a reporting debt (a regular payment that slips 30 days late
+    // is reported just like a past-due account) ...
+    s += bureauCost(ctx, ob)
+    // ... and, for regular payments, the cost of being late at all
+    if (!ob.isPastDueCatchUp && missed(ob)) s += ob.lateFee > 0 ? ob.lateFee : LATE_PENALTY
   }
   return s
 }
@@ -618,6 +706,31 @@ function repairAdvances(ctx: Ctx, advances: AdvanceReq[]): AdvanceReq[] {
 }
 
 /**
+ * The days an advance could be requested for a payment, and how much it would need to
+ * add. A payment heading for a report (a past-due catch-up, or one the plan is letting
+ * be reported) can use the whole last safe stretch before its report date — a later day
+ * may have room the earlier one doesn't (a new pay period's limit). Any other payment
+ * only has its due date.
+ */
+function advanceWindow(ob: Obligation) {
+  if (ob.deadline === null) return null
+  const heading =
+    ob.hardDeadline !== null && ob.reportDate !== null && (ob.isPastDueCatchUp || missesBureau(ob))
+  return {
+    start: heading ? (ob.hardDeadline as string) : ob.deadline,
+    end: heading ? addDays(ob.reportDate as string, -1) : ob.deadline,
+    by: heading ? (ob.shortByHard ?? ob.shortBy) : ob.shortBy,
+    min: heading ? (ob.shortMinHard ?? ob.shortMin) : ob.shortMin,
+  }
+}
+
+/** Most urgent first: payments being reported, then the rest of the reporting ones by report date, then the others */
+const byUrgency = (a: Obligation, b: Obligation) =>
+  Number(missesBureau(b)) - Number(missesBureau(a)) ||
+  (a.reportDate ?? '9999').localeCompare(b.reportDate ?? '9999') ||
+  (a.deadline ?? '').localeCompare(b.deadline ?? '')
+
+/**
  * One round of the advance search: from the most urgent payments an advance could
  * rescue, generate candidate advances, re-simulate each, and return the single
  * best move — or null when nothing makes the plan better. Payments about to be
@@ -636,28 +749,23 @@ function improveWithAdvance(
   const all = sim.obligations
     .map((ob, i) => ({ ob, i }))
     .filter(({ ob }) => needsAdvance(ob, sim))
-    .sort(
-      (a, b) =>
-        Number(b.ob.bureauCritical) - Number(a.ob.bureauCritical) ||
-        (a.ob.deadline ?? '').localeCompare(b.ob.deadline ?? '') ||
-        a.i - b.i,
-    )
+    .sort((a, b) => byUrgency(a.ob, b.ob) || a.i - b.i)
   const missedFirst = all.filter(({ ob }) => missed(ob))
   const candidates = (missedFirst.length > 0 ? missedFirst : all).slice(0, MAX_CANDIDATES)
 
   let best: { advances: AdvanceReq[]; sim: Sim; score: number } | null = null
   for (const { ob } of candidates) {
-    const deadline = ob.deadline as string
-    const need = Math.ceil(ob.shortBy ?? 0)
+    const w = advanceWindow(ob)
+    if (!w || w.by === undefined) continue
+    const deadline = w.start
+    const need = Math.ceil(w.by)
     if (need <= 0 || addDays(deadline, -lead) < ctx.today) continue
-    // A payment about to be reported can wait until the day before it is: a later
-    // day may have room the deadline day doesn't (a new pay period's limit).
-    const lastDay = ob.bureauCritical && ob.reportDate ? addDays(ob.reportDate, -1) : deadline
+    const lastDay = w.end
     const options: AdvanceReq[][] = []
 
     // Two sizes: everything missing (clears any overdraft too), or the least that lets
     // the overdraft room cover the rest — which leaves more of the limit for others.
-    const sizes = [...new Set([Math.ceil(ob.shortMin ?? need), need].filter((n) => n >= 1))]
+    const sizes = [...new Set([Math.ceil(w.min ?? need), need].filter((n) => n >= 1))]
 
     // Top up an advance that's already out and still unpaid on this deadline:
     // one fee instead of two.
@@ -755,19 +863,19 @@ function backwardAdvances(
   // every day a payment headed for the bureaus (or otherwise short) could use an advance:
   // from its deadline to the last day it can wait
   const needy = sim.obligations
-    .filter((ob) => needsAdvance(ob, sim) || (ob.bureauCritical && !ob.autopay && ob.deadline !== null))
-    .sort(
-      (a, b) =>
-        Number(b.bureauCritical) - Number(a.bureauCritical) ||
-        (a.deadline ?? '').localeCompare(b.deadline ?? ''),
+    .filter(
+      (ob) =>
+        needsAdvance(ob, sim) ||
+        (ob.isPastDueCatchUp && ob.bureauCritical && !ob.autopay && ob.deadline !== null),
     )
+    .sort(byUrgency)
     .slice(0, MAX_BACKWARD_PAYMENTS)
   const days = new Map<string, string[]>()
   for (const a of seed) days.set(a.requestDate, [...a.forDebts])
   for (const ob of needy) {
-    const deadline = ob.deadline as string
-    const lastDay = ob.bureauCritical && ob.reportDate ? addDays(ob.reportDate, -1) : deadline
-    for (let arrive = deadline; arrive <= lastDay; arrive = addDays(arrive, 1)) {
+    const w = advanceWindow(ob)
+    if (!w) continue
+    for (let arrive = w.start; arrive <= w.end; arrive = addDays(arrive, 1)) {
       const request = addDays(arrive, -lead)
       if (request >= ctx.today) days.set(request, [...(days.get(request) ?? []), ob.debtName])
     }
@@ -816,7 +924,8 @@ function shrinkAdvances(
     let lo = 1
     let hi = current.advances[i].amount
     let best = { advances: current.advances, sim: current.sim }
-    while (lo < hi) {
+    // within $2 is close enough: every step below is another full simulation
+    while (hi - lo > 2) {
       const mid = Math.floor((lo + hi) / 2)
       const trial = current.advances.map((a, j) => (j === i ? { ...a, amount: mid } : a))
       const trialSim = simulate(ctx, trial)
@@ -970,7 +1079,7 @@ function toResult(ctx: Ctx, sim: Sim, advances: AdvanceReq[]): PlanResult {
                   !o.autopay &&
                   !o.isPastDueCatchUp &&
                   o.plannedDate &&
-                  o.plannedDate <= (ob.deadline ?? ob.dueDate),
+                  o.plannedDate <= (ob.hardDeadline ?? ob.deadline ?? ob.dueDate),
               )
               .map((o) => o.debtName),
           ),
@@ -1050,6 +1159,10 @@ function buildObligations(
           : null,
         bureauCritical: debt.reportsToBureau,
         reportDate: debt.reportsToBureau ? addDays(since, bureauReportDays) : null,
+        hardDeadline: debt.reportsToBureau
+          ? maxDate(today, addDays(since, bureauReportDays - 1 - safetyDays))
+          : null,
+        beyondHorizon: debt.reportsToBureau ? addDays(since, bureauReportDays) > horizonEnd : false,
         lateFee: 0,
         isPastDueCatchUp: true,
         daysUntilReport: debt.reportsToBureau
@@ -1058,7 +1171,6 @@ function buildObligations(
         reportsToBureau: debt.reportsToBureau,
         // a catch-up is a manual payment even on an autopay debt
         autopay: false,
-        canWait: false,
         plannedDate: null,
       })
     }
@@ -1078,15 +1190,18 @@ function buildObligations(
         dueDate: due,
         // don't tie up cash more than 7 days before the due date
         payableFrom: maxDate(today, addDays(due, -7)),
-        // a bill that can wait has no deadline to borrow for: it's paid from real cash only
-        deadline: debt.canWait ? null : due,
-        bureauCritical: false,
-        reportDate: null,
+        deadline: due,
+        // a regular payment on a reporting debt is reported if it slips 30 days past its due date
+        bureauCritical: debt.reportsToBureau,
+        reportDate: debt.reportsToBureau ? addDays(due, bureauReportDays) : null,
+        hardDeadline: debt.reportsToBureau
+          ? maxDate(today, addDays(due, bureauReportDays - 1 - safetyDays))
+          : null,
+        beyondHorizon: debt.reportsToBureau ? addDays(due, bureauReportDays) > horizonEnd : false,
         lateFee: debt.lateFee ?? 0,
         isPastDueCatchUp: false,
         reportsToBureau: debt.reportsToBureau,
         autopay: debt.autopay === true,
-        canWait: debt.canWait === true,
         plannedDate: null,
       })
       remaining -= amount
@@ -1098,9 +1213,9 @@ function buildObligations(
 
 /** A past-due catch-up that isn't paid before its report date */
 function missesBureau(ob: Obligation): boolean {
-  return (
-    ob.bureauCritical && ob.reportDate !== null && (!ob.plannedDate || ob.plannedDate >= ob.reportDate)
-  )
+  if (!ob.bureauCritical || ob.reportDate === null) return false
+  if (!ob.plannedDate) return !ob.beyondHorizon // unpaid at the end of the plan, and reported by then
+  return ob.plannedDate >= ob.reportDate
 }
 
 function paymentStatus(ob: Obligation): PlannedPayment['status'] {

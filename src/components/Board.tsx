@@ -12,7 +12,7 @@ const COLUMNS: { id: ColumnId; title: string; hint: string }[] = [
   {
     id: 'report_risk',
     title: '🚨 Bureau report risk',
-    hint: 'Past due and close to being reported to credit bureaus — pay these first',
+    hint: 'Past due, or a payment that would slip 30 days late — reported to the credit bureaus soonest first',
   },
   {
     id: 'past_due',
@@ -56,6 +56,7 @@ export default function Board({
 
   function columnFor(debt: Debt): ColumnId {
     const p = nextPayment.get(debt.id)
+    if (p?.missesBureau) return 'report_risk' // heading for a report, past due yet or not
     if (debt.pastDue && debt.reportsToBureau) {
       const days = p?.daysUntilReport ?? 0
       if (days <= 10) return 'report_risk'

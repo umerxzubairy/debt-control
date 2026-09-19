@@ -69,7 +69,6 @@ export default function Debts({
               <td>
                 <strong>{d.name}</strong>
                 {d.autopay && <span className="pill autopay-pill">autopay</span>}
-                {d.canWait && <span className="pill">can wait</span>}
                 {!d.reportsToBureau && <span className="pill">no bureau</span>}
               </td>
               <td>{DEBT_TYPE_LABELS[d.type]}</td>
@@ -289,22 +288,7 @@ function DebtForm({
           />
           Autopay
         </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={d.canWait === true}
-            onChange={(e) => set({ canWait: e.target.checked })}
-          />
-          Can wait
-        </label>
       </div>
-      {d.canWait && (
-        <p className="muted">
-          Paid last, and only from money actually in your account — the plan never uses
-          overdraft or a pay advance to pay this one on time. Good for bills that don't report
-          to the credit bureaus and can be late (mind any late fee or lapse).
-        </p>
-      )}
       {d.autopay && (
         <p className="muted">
           Deducted automatically on the due date, so the planner can't delay it — it plans

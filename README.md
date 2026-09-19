@@ -18,6 +18,7 @@ All data lives in your browser's localStorage. No server, no account, no trackin
 - **Real paychecks** — biweekly/weekly/semi-monthly/monthly pay, earned-wage advances (PayActiv etc.) deducted from your next check, and a living-expenses set-aside so the plan never spends your grocery money.
 - **Works from your real balance** — start from what's actually in your account, even if you're negative in overdraft.
 - **One-time money** — log a bonus, tax refund, or a one-off bill and the plan reflows around it.
+- **Prioritized by credit-bureau report date** — every payment on a reporting debt gets a report date (a past-due account's missed date + 30 days, or a regular payment's due date + 30). Money goes to whatever would be reported soonest; past-due accounts come next, then ordinary bills. Bills that aren't reported (insurance, taxes) can't take money — overdraft or pay advances included — that a reporting payment needs first.
 - **Kanban board by urgency**:
   - 🚨 **Bureau report risk** — past due and near the ~30-day reporting mark (threshold configurable)
   - ⏰ **Past due** — behind, but reporting isn't imminent
@@ -49,7 +50,7 @@ Open http://localhost:5173, then:
 The engine ([`src/engine/planner.ts`](src/engine/planner.ts)) simulates your cash day-by-day over a 12-week horizon:
 
 1. Paychecks land on your paydays (minus advances and living expenses); one-time money in/out is applied on its date.
-2. Obligations are funded in priority order: past-due catch-ups closest to bureau reporting first, then minimums by due date.
+2. Obligations are funded in priority order: anything that would be reported to the credit bureaus, soonest report date first; then other past-due accounts; then ordinary bills by due date. Borrowed money (overdraft, pay advances) is held back for whatever is about to be reported.
 3. A payment is scheduled on the first day the cash covers it — if that's after the due date it's flagged **late**, and if it never fits it's **unfunded**.
 4. Whatever's left at the end of the horizon is the **surplus** suggested for extra principal on the avalanche/snowball target.
 

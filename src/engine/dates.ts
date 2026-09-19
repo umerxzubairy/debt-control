@@ -16,15 +16,33 @@ export function parseISO(s: string): Date {
   return new Date(y, m - 1, d)
 }
 
+// The planner asks the same few hundred date questions hundreds of thousands of times,
+// so these two are memoized (a Date object is built and thrown away on every miss).
+const CACHE_LIMIT = 200_000
+const addDaysCache = new Map<string, string>()
+const daysBetweenCache = new Map<string, number>()
+
 export function addDays(iso: string, days: number): string {
+  const key = `${iso}|${days}`
+  const hit = addDaysCache.get(key)
+  if (hit !== undefined) return hit
   const d = parseISO(iso)
   d.setDate(d.getDate() + days)
-  return toISO(d)
+  const out = toISO(d)
+  if (addDaysCache.size > CACHE_LIMIT) addDaysCache.clear()
+  addDaysCache.set(key, out)
+  return out
 }
 
 export function daysBetween(fromISO: string, toISOstr: string): number {
+  const key = `${fromISO}|${toISOstr}`
+  const hit = daysBetweenCache.get(key)
+  if (hit !== undefined) return hit
   const ms = parseISO(toISOstr).getTime() - parseISO(fromISO).getTime()
-  return Math.round(ms / 86_400_000)
+  const out = Math.round(ms / 86_400_000)
+  if (daysBetweenCache.size > CACHE_LIMIT) daysBetweenCache.clear()
+  daysBetweenCache.set(key, out)
+  return out
 }
 
 /** Next occurrence of a day-of-month on or after `fromISO`, clamped to month length. */
